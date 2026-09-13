@@ -55,6 +55,12 @@ export default function WatchPage() {
 
       {error && <p className="mb-4 rounded-lg bg-red-900/30 px-3 py-2 text-sm text-red-300">{error}</p>}
 
+      {subtitles.errorMessage && (
+        <p className="mb-4 rounded-lg bg-red-900/30 px-3 py-2 text-sm text-red-300">
+          {subtitles.errorMessage}
+        </p>
+      )}
+
       {subtitles.sessionEnded && (
         <p className="mb-4 rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-300">
           本场直播已结束。

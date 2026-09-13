@@ -6,6 +6,7 @@ const LABELS: Record<ConnectionState, { text: string; cls: string; dot: string }
   open: { text: "已连接", cls: "bg-emerald-500/15 text-emerald-300", dot: "bg-emerald-400" },
   reconnecting: { text: "断线重连中…", cls: "bg-red-500/15 text-red-300", dot: "bg-red-400 live-dot" },
   closed: { text: "直播已结束", cls: "bg-slate-700/60 text-slate-300", dot: "bg-slate-400" },
+  denied: { text: "无访问权限", cls: "bg-red-600/20 text-red-200", dot: "bg-red-500" },
 };
 
 export function ConnectionBadge({ state, attempts }: { state: ConnectionState; attempts: number }) {

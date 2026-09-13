@@ -11,6 +11,7 @@ import (
 
 	"github.com/livesub/gateway/internal/auth"
 	"github.com/livesub/gateway/internal/config"
+	"github.com/livesub/gateway/internal/ws"
 )
 
 // fakeLookup 测试用令牌反查：<token> 直接映射到 <sessionID>:<role>。
@@ -46,6 +47,8 @@ func newTestServer(t *testing.T) *Server {
 	}
 	s := NewServer(cfg, nil, rdb, nil, nil)
 	s.SetTokenLookupForTest(fakeLookup{})
+	// 注入真实 hub（statusChecker 为 nil 时默认会话 active），供 WS 路由测试。
+	s.SetHub(ws.NewHub(rdb, "subtitles", []string{"*"}, nil))
 	return s
 }
 
@@ -142,6 +145,40 @@ func TestListSessionsHiddenWithoutAPIKey(t *testing.T) {
 	server.Router().ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("list sessions -> %d, want 404", w.Code)
+	}
+}
+
+// 回归：view 令牌必须能通过真实读路由（GET 会话/字幕）。
+// 曾因路由同时声明 RoleHost,RoleView 使 wantHost=true 而误拒 view（观众 403 根因）。
+func TestViewTokenPassesRealReadRoutes(t *testing.T) {
+	server := newTestServer(t)
+	paths := []string{
+		"/api/v1/sessions/x",
+		"/api/v1/sessions/x/subtitles",
+	}
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		req := withBearer(httptest.NewRequest(http.MethodGet, path, nil), "view-token-x")
+		server.Router().ServeHTTP(w, req)
+		// 鉴权必须放行（db 为 nil 后续可能 500，但绝不能是 401/403）。
+		if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+			t.Fatalf("GET %s with view token -> %d, want auth pass", path, w.Code)
+		}
+	}
+}
+
+// view 令牌经 query token（WS 场景）也应通过读路由鉴权。
+func TestViewQueryTokenPassesReadRoute(t *testing.T) {
+	server := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/sessions/x/subtitles/ws?replay=20&token=view-token-x", nil)
+	// 鉴权中间件先于 WS handler 执行：即使后续 handler 因夹具未注入 hub 而 panic，
+	// Recovery 也会返回 500；关键断言是不能在鉴权层被 401/403 拦截。
+	defer func() { _ = recover() }()
+	server.Router().ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+		t.Fatalf("WS with view query token -> %d, want auth pass", w.Code)
 	}
 }
 

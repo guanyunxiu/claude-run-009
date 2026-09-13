@@ -83,6 +83,23 @@ func TestHostAcceptedOnHostRoute(t *testing.T) {
 	}
 }
 
+// 回归：读路由只声明 RoleView 时，view 令牌必须通过（host 同样满足）。
+// 曾因路由同时传 RoleHost,RoleView 导致 wantHost=true 而误拒 view（观众 403）。
+func TestViewAcceptedOnViewRoute(t *testing.T) {
+	r := newRouter(lookup(), "", false, RoleView)
+	if w := do(r, http.MethodGet, "/api/v1/sessions/s1/subtitles", "view-tok", ""); w.Code != http.StatusOK {
+		t.Fatalf("view token on view route got %d want 200", w.Code)
+	}
+}
+
+// view 令牌通过 query（WS 场景）访问读路由应成功。
+func TestViewQueryTokenAcceptedOnViewRoute(t *testing.T) {
+	r := newRouter(lookup(), "", true, RoleView)
+	if w := do(r, http.MethodGet, "/api/v1/sessions/s1/subtitles", "", "view-tok"); w.Code != http.StatusOK {
+		t.Fatalf("view query token got %d want 200", w.Code)
+	}
+}
+
 func TestTokenCannotCrossSessions(t *testing.T) {
 	r := newRouter(lookup(), "", false, RoleHost, RoleView)
 	if w := do(r, http.MethodGet, "/api/v1/sessions/other/subtitles", "host-tok", ""); w.Code != http.StatusUnauthorized {

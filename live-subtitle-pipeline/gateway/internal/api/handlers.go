@@ -99,9 +99,11 @@ func (s *Server) buildRoutes() {
 		// 列会话是全局运维接口：仅持有 GATEWAY_API_KEY 可访问（未配置则 404）。
 		v1.GET("/sessions", auth.GlobalAPIKeyOnly(s.cfg.APIKey), s.handleListSessions)
 
-		// 会话元数据：主播/观众令牌均可。
+		// 会话读路径：声明最低角色 view（host 天然满足 view）。
+		// 注意：不要同时传 RoleHost——host 已在 roleSatisfies 内被赋予 view 权限，
+		// 同时声明两者会导致 wantHost=true 而误拒 view（曾造成观众 403）。
 		sess := v1.Group("/sessions/:id",
-			auth.Middleware(s, s.cfg.APIKey, true, auth.RoleHost, auth.RoleView))
+			auth.Middleware(s, s.cfg.APIKey, true, auth.RoleView))
 		{
 			sess.GET("", s.handleGetSession)
 			sess.GET("/subtitles", s.handleListSubtitles)

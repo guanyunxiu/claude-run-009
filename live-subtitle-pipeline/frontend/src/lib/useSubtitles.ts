@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { Subtitle } from "./types";
 
-export type ConnectionState = "idle" | "connecting" | "open" | "reconnecting" | "closed";
+export type ConnectionState =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed"
+  | "denied";
 
 export interface SubtitleState {
   /** 已确认 final 字幕，按 seq+startMs 排序并去重 */
@@ -16,9 +22,12 @@ export interface SubtitleState {
   lastLatency: { queueMs: number; asrMs: number; e2eMs: number } | null;
   reconnectAttempts: number;
   sessionEnded: boolean;
+  /** 鉴权被拒（401/403）等不可恢复错误的说明 */
+  errorMessage: string;
 }
 
 const MAX_FINALS = 500;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 /**
  * 订阅会话字幕：
@@ -41,6 +50,7 @@ export function useSubtitles(sessionId: string | undefined, options?: UseSubtitl
     lastLatency: null,
     reconnectAttempts: 0,
     sessionEnded: false,
+    errorMessage: "",
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -112,6 +122,15 @@ export function useSubtitles(sessionId: string | undefined, options?: UseSubtitl
 
   const connect = useCallback(() => {
     if (!sessionId) return;
+    // 无令牌直接判定为拒绝，避免 401 触发指数退避无限重连。
+    if (!token) {
+      setState((prev) => ({
+        ...prev,
+        connection: "denied",
+        errorMessage: "缺少访问令牌，请使用有效链接进入（主播从主播台、观众用邀请链接）。",
+      }));
+      return;
+    }
     closedByUserRef.current = false;
 
     const isReconnect = attemptsRef.current > 0;
@@ -146,12 +165,25 @@ export function useSubtitles(sessionId: string | undefined, options?: UseSubtitl
       }
       attemptsRef.current += 1;
       const attempt = attemptsRef.current;
+
+      // 重连上限：避免任何异常情况下无限重连刷屏。
+      if (attempt > MAX_RECONNECT_ATTEMPTS) {
+        closedByUserRef.current = true;
+        setState((prev) => ({
+          ...prev,
+          connection: "closed",
+          errorMessage: `已连续 ${MAX_RECONNECT_ATTEMPTS} 次无法连接，已停止重连。请检查网关后刷新页面。`,
+        }));
+        return;
+      }
+
       // 指数退避：1s, 2s, 4s ... 上限 15s。
       const delay = Math.min(15_000, 1_000 * 2 ** Math.min(attempt - 1, 4));
       setState((prev) => ({ ...prev, connection: "reconnecting" }));
       timerRef.current = window.setTimeout(async () => {
-        // 重连前核查会话状态：若期间直播已结束（错过 session-end），
-        // 立即停止，不再无限重连。
+        // 重连前用 REST 复核：
+        //  - 会话已结束：停止（错过 session-end 的兜底）；
+        //  - 401/403：令牌无效/越权，停止重连，明确提示而不是无限 403。
         try {
           const info = await api.getSession(sessionId, { token });
           if (info.status === "ended") {
@@ -159,8 +191,21 @@ export function useSubtitles(sessionId: string | undefined, options?: UseSubtitl
             setState((prev) => ({ ...prev, connection: "closed", sessionEnded: true }));
             return;
           }
-        } catch {
-          // 接口暂时不可用（网关重启中）：继续退避重连 WS，由重连本身补发。
+        } catch (exc) {
+          const status = (exc as { status?: number }).status;
+          if (status === 401 || status === 403) {
+            closedByUserRef.current = true;
+            setState((prev) => ({
+              ...prev,
+              connection: "denied",
+              errorMessage:
+                status === 403
+                  ? "无权访问该会话（角色不足，如观众令牌访问主播接口）。"
+                  : "访问令牌无效或已失效，请使用有效链接重新进入。",
+            }));
+            return;
+          }
+          // 其它（网关重启/网络）：继续退避重连，由 WS replay 补发。
         }
         connect();
       }, delay);
@@ -172,6 +217,8 @@ export function useSubtitles(sessionId: string | undefined, options?: UseSubtitl
     finalsRef.current = [];
     partialRef.current = new Map();
     attemptsRef.current = 0;
+    closedByUserRef.current = false;
+    setState((prev) => ({ ...prev, errorMessage: "", sessionEnded: false }));
     connect();
     return () => {
       closedByUserRef.current = true;
