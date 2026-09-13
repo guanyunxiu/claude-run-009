@@ -2,6 +2,29 @@
 
 所有接口前缀：`/api/v1`。容器内由前端 nginx 同源反代；本地开发由 Vite 代理到 `http://localhost:8080`。
 
+## 鉴权
+
+采用**会话级随机令牌**（192-bit 随机数的 hex，创建会话时一次性返回，服务端不回显）：
+
+| 令牌 | 能力 |
+| --- | --- |
+| `hostToken` | 主播：上传分片、结束会话、查看字幕、挂 WebSocket |
+| `viewToken` | 观众：查看字幕、挂 WebSocket |
+
+- 除 `POST /sessions`、`GET /health`、`GET /time` 外，所有接口都需要令牌。
+- REST 请求头：`Authorization: Bearer <token>`。
+- 浏览器 WebSocket 无法设置请求头，允许 `?token=<token>`（仅读路径；上传/结束**不**接受 query token）。
+- 令牌与会话绑定：A 会话令牌访问 B 会话返回 401；观众令牌访问主播接口返回 403。
+- WebSocket 握手校验 `Origin`：`WS_ALLOWED_ORIGINS=*` 放行全部（开发默认）；生产配置具体来源，默认仅允许与 `Host` 同源，跨站被拒（403）。无 `Origin` 头的非浏览器客户端（curl/服务端）放行，由令牌鉴权。
+- 全局 `GATEWAY_API_KEY`：运维密钥，持有者等价 host（供 RTMP 拉流脚本跨会话使用）。未配置时 `GET /sessions` 直接返回 404。
+
+```json
+// POST /sessions 响应（令牌只在此处出现一次）
+{ "id": "…", "hostToken": "…", "viewToken": "…", "…": "…" }
+```
+
+观众邀请链接形如 `/watch/<sessionId>?token=<viewToken>`。
+
 ## REST
 
 ### 健康检查 / 时钟
@@ -65,11 +88,14 @@ GET /sessions/:id/subtitles?limit=100&beforeSeq=50
 ## WebSocket
 
 ```
-GET /sessions/:id/subtitles/ws?replay=20
+GET /sessions/:id/subtitles/ws?replay=20&token=<viewToken|hostToken>
 ```
 
+- 需要会话令牌：浏览器用 query `token`（无法设置请求头）；服务端非浏览器客户端可用 `Authorization: Bearer`。
+- 握手校验 `Origin`（见鉴权一节），跨站来源返回 403。
 - 连接建立时回放该会话最近 N 条 final（Redis ZSET，按 `startMs` 顺序）。
-- 服务端定时发送 Ping；客户端关闭/断线后应指数退避重连，重连带 `replay=50` 补齐缺口。
+- 服务端定时发送 Ping；客户端断线后指数退避重连，重连带 `replay=50` 补齐缺口。
+- **错过 session-end 不死循环重连**：若连接时会话已 `ended`，服务端仍完成握手，先补发一条 `session-end` 再关闭；客户端在每次重连前也会调用 `GET /sessions/:id` 复核状态，发现 ended 即停止重连。
 - 服务端推送两条消息类型：
 
 ### `subtitle`（partial 与 final 同构）
@@ -111,6 +137,7 @@ GET /sessions/:id/subtitles/ws?replay=20
 | Key / Stream | 类型 | 内容 |
 | --- | --- | --- |
 | `asr:tasks` | Stream | ASR 任务，field `data` 为任务 JSON |
+| `asr:deadletter` | Stream | 处理失败超过 5 次的毒消息（含 originalId/error，裁剪保留 1000 条） |
 | `asr-workers` | Consumer Group | 所有 worker 实例同组（`XREADGROUP` + `XAUTOCLAIM`） |
 | `subtitles:<sessionId>` | Pub/Sub | 实时字幕扇出频道 |
 | `subtitles:hot:<sessionId>` | ZSET | 最近 final 字幕，score=`startMs`，member=消息 JSON；TTL 1h，裁剪 100 条 |

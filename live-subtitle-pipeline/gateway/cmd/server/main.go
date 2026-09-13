@@ -59,10 +59,12 @@ func main() {
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	hub := ws.NewHub(rdb, cfg.PubSubPrefix)
+	// Server 实现 ws.SessionStatusChecker：先建 server（路由中引用 hub 字段），
+	// 再建 hub 并注入，解开 server<->hub 的构造循环。
+	server := api.NewServer(cfg, database, rdb, store, nil)
+	hub := ws.NewHub(rdb, cfg.PubSubPrefix, cfg.WSAllowedOrigins, server)
+	server.SetHub(hub)
 	go hub.RunPubSub(rootCtx)
-
-	server := api.NewServer(cfg, database, rdb, store, hub)
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           server.Router(),

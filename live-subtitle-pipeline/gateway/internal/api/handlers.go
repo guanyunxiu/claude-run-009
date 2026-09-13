@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/livesub/gateway/internal/auth"
 	"github.com/livesub/gateway/internal/config"
 	"github.com/livesub/gateway/internal/model"
 	"github.com/livesub/gateway/internal/queue"
@@ -31,6 +33,14 @@ type Server struct {
 	rdb    *redis.Client
 	hub    *ws.Hub
 	router *gin.Engine
+
+	// tokenLookupOverride 仅供测试注入鉴权身份（避免依赖真实 PostgreSQL）。
+	tokenLookupOverride auth.TokenLookup
+}
+
+// SetTokenLookupForTest 仅供测试：替换令牌反查实现。
+func (s *Server) SetTokenLookupForTest(lookup auth.TokenLookup) {
+	s.tokenLookupOverride = lookup
 }
 
 func NewServer(cfg config.Config, database *sql.DB, rdb *redis.Client, store *storage.ObjectStore, hub *ws.Hub) *Server {
@@ -43,10 +53,29 @@ func NewServer(cfg config.Config, database *sql.DB, rdb *redis.Client, store *st
 		hub:   hub,
 	}
 
+	s.buildRoutes()
+	return s
+}
+
+// SetHub 注入 Hub（解决 Server 与 Hub 的构造循环：Server 实现
+// ws.SessionStatusChecker，Hub 又需要在路由中处理 WS）。
+func (s *Server) SetHub(hub *ws.Hub) {
+	s.hub = hub
+}
+
+func (s *Server) requireHub() *ws.Hub {
+	if s.hub == nil {
+		// 正常启动顺序下不会发生：main 在 ListenAndServe 前完成注入。
+		panic("ws.Hub not injected")
+	}
+	return s.hub
+}
+
+func (s *Server) buildRoutes() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
-	allowAll := contains(cfg.CORSOrigins, "*")
+	allowAll := contains(s.cfg.CORSOrigins, "*")
 	corsConfig := cors.Config{
 		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
 		AllowHeaders: []string{"Origin", "Content-Type", "Authorization"},
@@ -55,7 +84,7 @@ func NewServer(cfg config.Config, database *sql.DB, rdb *redis.Client, store *st
 		// 通配模式：只能开 AllowAllOrigins，不能同时给 AllowOrigins 或凭证。
 		corsConfig.AllowAllOrigins = true
 	} else {
-		corsConfig.AllowOrigins = cfg.CORSOrigins
+		corsConfig.AllowOrigins = s.cfg.CORSOrigins
 		corsConfig.AllowCredentials = true
 	}
 	router.Use(cors.New(corsConfig))
@@ -64,17 +93,36 @@ func NewServer(cfg config.Config, database *sql.DB, rdb *redis.Client, store *st
 	{
 		v1.GET("/health", s.handleHealth)
 		v1.GET("/time", s.handleServerTime)
+		// 创建会话本身不鉴权：任何人都可开播，创建后返回仅自己可见的 hostToken。
 		v1.POST("/sessions", s.handleCreateSession)
-		v1.GET("/sessions", s.handleListSessions)
-		v1.GET("/sessions/:id", s.handleGetSession)
-		v1.POST("/sessions/:id/end", s.handleEndSession)
-		v1.POST("/sessions/:id/chunks", s.handleUploadChunk)
-		v1.GET("/sessions/:id/subtitles", s.handleListSubtitles)
-		v1.GET("/sessions/:id/subtitles/ws", hub.HandleWS)
+
+		// 列会话是全局运维接口：仅持有 GATEWAY_API_KEY 可访问（未配置则 404）。
+		v1.GET("/sessions", auth.GlobalAPIKeyOnly(s.cfg.APIKey), s.handleListSessions)
+
+		// 会话元数据：主播/观众令牌均可。
+		sess := v1.Group("/sessions/:id",
+			auth.Middleware(s, s.cfg.APIKey, true, auth.RoleHost, auth.RoleView))
+		{
+			sess.GET("", s.handleGetSession)
+			sess.GET("/subtitles", s.handleListSubtitles)
+			// WebSocket：浏览器无法设置请求头，允许 query token（仅读）。
+			// Origin 在 Hub.HandleWS 内做白名单/同源校验。
+			sess.GET("/subtitles/ws", func(c *gin.Context) {
+				s.requireHub().HandleWS(c)
+			})
+		}
+
+		// 主播专属：上传分片、结束会话（不接受 query token，只认 Authorization 头，
+		// 防止令牌出现在 URL/历史记录中被滥用）。
+		host := v1.Group("/sessions/:id",
+			auth.Middleware(s, s.cfg.APIKey, false, auth.RoleHost))
+		{
+			host.POST("/end", s.handleEndSession)
+			host.POST("/chunks", s.handleUploadChunk)
+		}
 	}
 
 	s.router = router
-	return s
 }
 
 func (s *Server) Router() *gin.Engine { return s.router }
@@ -135,12 +183,18 @@ func (s *Server) handleCreateSession(ctx *gin.Context) {
 	}
 
 	sessionID := uuid.NewString()
+	hostToken, viewToken, err := auth.NewTokenPair()
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "generate tokens: " + err.Error()})
+		return
+	}
 	targetsJSON, _ := json.Marshal(normalizeTargets(req.TargetLanguages))
 
-	_, err := s.db.ExecContext(ctx.Request.Context(),
-		`INSERT INTO sessions (id, source_language, target_languages, media_type, sample_rate, channels)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		sessionID, req.SourceLanguage, targetsJSON, req.MediaType, req.SampleRate, req.Channels)
+	_, err = s.db.ExecContext(ctx.Request.Context(),
+		`INSERT INTO sessions (id, source_language, target_languages, media_type, sample_rate, channels, host_token, view_token)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		sessionID, req.SourceLanguage, targetsJSON, req.MediaType, req.SampleRate, req.Channels,
+		hostToken, viewToken)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -155,8 +209,49 @@ func (s *Server) handleCreateSession(ctx *gin.Context) {
 		"channels":        req.Channels,
 		"status":          "active",
 		"createdAt":       time.Now().UTC().Format(time.RFC3339),
-		"wsUrl":           fmt.Sprintf("/api/v1/sessions/%s/subtitles/ws", sessionID),
+		// 令牌仅在创建时返回一次；服务端不再回显（GET /sessions/:id 不含令牌）。
+		"hostToken": hostToken,
+		"viewToken": viewToken,
+		"wsUrl":     fmt.Sprintf("/api/v1/sessions/%s/subtitles/ws", sessionID),
 	})
+}
+
+// IdentityByToken 实现 auth.TokenLookup：按令牌反查会话身份。
+func (s *Server) IdentityByToken(token string) (*auth.SessionIdentity, error) {
+	if s.tokenLookupOverride != nil {
+		return s.tokenLookupOverride.IdentityByToken(token)
+	}
+	var sessionID, role string
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT id,
+		        CASE
+		          WHEN host_token = $1 THEN 'host'
+		          WHEN view_token = $1 THEN 'view'
+		          ELSE ''
+		        END AS role
+		 FROM sessions
+		 WHERE host_token = $1 OR view_token = $1`, token).Scan(&sessionID, &role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		return nil, nil
+	}
+	return &auth.SessionIdentity{SessionID: sessionID, Role: auth.Role(role)}, nil
+}
+
+// SessionStatus 实现 ws.SessionStatusChecker，供 WS 握手时判断会话是否已结束。
+func (s *Server) SessionStatus(ctx context.Context, sessionID string) (string, error) {
+	var status string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status FROM sessions WHERE id=$1`, sessionID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return status, err
 }
 
 func (s *Server) handleListSessions(ctx *gin.Context) {
@@ -227,17 +322,21 @@ func (s *Server) handleGetSession(ctx *gin.Context) {
 
 func (s *Server) handleEndSession(ctx *gin.Context) {
 	id := ctx.Param("id")
+	// 幂等：无论之前是 active 还是已结束都返回 200，避免主播端重试报错。
 	tag, err := s.db.ExecContext(ctx.Request.Context(),
-		`UPDATE sessions SET status='ended', ended_at=now() WHERE id=$1 AND status='active'`, id)
+		`UPDATE sessions SET status='ended', ended_at=COALESCE(ended_at, now())
+		 WHERE id=$1`, id)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if rows, _ := tag.RowsAffected(); rows == 0 {
-		ctx.JSON(http.StatusNotFound, gin.H{"error": "active session not found"})
+		ctx.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
-	s.hub.PublishSessionEnd(ctx.Request.Context(), id)
+	if s.hub != nil {
+		s.hub.PublishSessionEnd(ctx.Request.Context(), id)
+	}
 	ctx.JSON(http.StatusOK, gin.H{"id": id, "status": "ended"})
 }
 

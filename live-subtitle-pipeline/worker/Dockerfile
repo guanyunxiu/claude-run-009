@@ -17,7 +17,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # 国内构建可传 --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG PIP_INDEX_URL=""
+ARG PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 COPY requirements.txt requirements-whisper.txt ./
 RUN pip install --upgrade pip && \

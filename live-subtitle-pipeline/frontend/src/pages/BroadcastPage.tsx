@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { AudioRecorder, type PcmChunk } from "../lib/recorder";
 import type { SessionInfo } from "../lib/types";
+import { resolveToken } from "../lib/tokens";
 import { useSubtitles } from "../lib/useSubtitles";
 import { ConnectionBadge } from "../components/ConnectionBadge";
 import { LatencyMeter } from "../components/LatencyMeter";
@@ -29,16 +30,31 @@ export default function BroadcastPage() {
     inFlight: 0,
   });
 
-  const recorderRef = useRef<AudioRecorder | null>(null);
-  const statRef = useRef(stat);
-  statRef.current = stat;
+  // 主播台使用 hostToken（本地存储；也接受 query 里的 token 用于直接进入）。
+  const token = useMemo(
+    () => resolveToken(id, "host", new URLSearchParams(window.location.search).get("token")),
+    [id],
+  );
 
-  const subtitles = useSubtitles(session?.id);
+  const recorderRef = useRef<AudioRecorder | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoActive, setVideoActive] = useState(false);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+
+  const subtitles = useSubtitles(session?.id, { token });
   const lastFinal = subtitles.finals[subtitles.finals.length - 1] ?? null;
 
   useEffect(() => {
-    api.getSession(id).then(setSession).catch((exc) => setError((exc as Error).message));
-  }, [id]);
+    if (!token) {
+      setError("缺少主播令牌（hostToken）。请从本机创建会话后进入主播台。");
+      return;
+    }
+    api
+      .getSession(id, { token })
+      .then(setSession)
+      .catch((exc) => setError((exc as Error).message));
+  }, [id, token]);
 
   const handleChunk = useCallback(
     async (chunk: PcmChunk) => {
@@ -48,7 +64,7 @@ export default function BroadcastPage() {
           id,
           { seq: chunk.seq, startMs: chunk.startMs, endMs: chunk.endMs },
           chunk.pcm,
-          "audio/pcm",
+          { token: tokenRef.current, contentType: "audio/pcm" },
         );
         setStat((prev) => ({
           chunks: prev.chunks + 1,
@@ -74,14 +90,21 @@ export default function BroadcastPage() {
     setError("");
     try {
       const recorder = new AudioRecorder();
-      await recorder.start(handleChunk);
+      await recorder.start(handleChunk, { video: true });
       recorderRef.current = recorder;
+      // 绑定摄像头流到预览 <video>（静音，避免本地回声）。
+      const stream = recorder.mediaStream;
+      if (videoRef.current && stream) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => undefined);
+      }
+      setVideoActive(recorder.videoActive);
       setRecording(true);
     } catch (exc) {
       setError(
-        "麦克风启动失败：" +
+        "采集启动失败：" +
           (exc as Error).message +
-          "（需要 HTTPS 或 localhost，并授权麦克风权限）",
+          "（需要 HTTPS 或 localhost，并授权麦克风/摄像头权限）",
       );
     }
   }
@@ -89,14 +112,18 @@ export default function BroadcastPage() {
   function stopMic() {
     recorderRef.current?.stop();
     recorderRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setVideoActive(false);
     setRecording(false);
   }
 
   async function endSession() {
     stopMic();
     try {
-      await api.endSession(id);
-      const refreshed = await api.getSession(id);
+      await api.endSession(id, { token: tokenRef.current });
+      const refreshed = await api.getSession(id, { token: tokenRef.current });
       setSession(refreshed);
     } catch (exc) {
       setError((exc as Error).message);
@@ -121,7 +148,25 @@ export default function BroadcastPage() {
       </header>
 
       {/* 模拟直播画面：字幕叠加层 */}
-      <div className="relative mb-6 aspect-video w-full overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-800 via-slate-900 to-black">
+      <div className="relative mb-6 aspect-video w-full overflow-hidden rounded-2xl border border-slate-800 bg-black">
+        {/* 真实摄像头画面：镜像显示更符合主播自拍习惯；无视频轨时显示占位。 */}
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={`h-full w-full object-cover ${recording && videoActive ? "-scale-x-100" : "hidden"}`}
+        />
+        {!(recording && videoActive) && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-slate-800 via-slate-900 to-black text-slate-600">
+            <span className="text-3xl">🎥</span>
+            <span className="text-sm">
+              {recording ? "无摄像头（纯音频字幕模式）" : "点击下方“开始采集并推流”开启摄像头直播"}
+            </span>
+            <span className="text-xs text-slate-700">Web Audio · 16kHz PCM · 3s 切片</span>
+          </div>
+        )}
+
         <div className="absolute left-4 top-4 flex items-center gap-2">
           {recording ? (
             <span className="inline-flex items-center gap-1.5 rounded-full bg-red-600/90 px-3 py-1 text-xs font-semibold text-white">
@@ -132,9 +177,6 @@ export default function BroadcastPage() {
               未开播
             </span>
           )}
-        </div>
-        <div className="absolute inset-0 flex items-center justify-center text-slate-700">
-          <span className="text-sm">浏览器 Web Audio 采集 · 16kHz PCM · 3s 切片</span>
         </div>
         <SubtitleOverlay
           partial={subtitles.currentPartial}

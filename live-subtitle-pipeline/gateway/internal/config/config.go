@@ -26,6 +26,13 @@ type Config struct {
 	CORSOrigins  []string
 	MaxAudioSize int64
 
+	// WebSocket 握手允许的浏览器 Origin（scheme://host[:port]）；
+	// "*" 放行全部（仅开发），空表示仅允许同源。
+	WSAllowedOrigins []string
+
+	// 全局运维 API Key（RTMP 拉流脚本 / 列会话）；为空则禁用相关全局接口。
+	APIKey string
+
 	ShutdownTimeout time.Duration
 }
 
@@ -47,6 +54,11 @@ func getenvInt(key string, fallback int) int {
 
 func Load() Config {
 	origins := getenv("CORS_ORIGINS", "*")
+	wsOrigins := getenv("WS_ALLOWED_ORIGINS", "")
+	if wsOrigins == "" {
+		// 默认与 CORS 同源策略保持一致。
+		wsOrigins = origins
+	}
 	return Config{
 		Addr:          getenv("GATEWAY_ADDR", ":8080"),
 		DatabaseURL:   getenv("DATABASE_URL", "postgres://subtitle:subtitle@localhost:5432/subtitles?sslmode=disable"),
@@ -62,8 +74,11 @@ func Load() Config {
 		MinIOBucket:    getenv("MINIO_BUCKET", "audio-chunks"),
 		MinIOSecure:    getenv("MINIO_SECURE", "false") == "true",
 
-		CORSOrigins:  strings.Split(origins, ","),
-		MaxAudioSize: int64(getenvInt("MAX_AUDIO_BYTES", 1<<20)),
+		CORSOrigins:      strings.Split(origins, ","),
+		WSAllowedOrigins: strings.Split(wsOrigins, ","),
+		MaxAudioSize:     int64(getenvInt("MAX_AUDIO_BYTES", 1<<20)),
+
+		APIKey: getenv("GATEWAY_API_KEY", ""),
 
 		ShutdownTimeout: 10 * time.Second,
 	}

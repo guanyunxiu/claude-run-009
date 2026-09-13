@@ -15,14 +15,18 @@ from typing import Any
 
 import redis
 
-from .audio import AudioDecodeError, decode_audio, is_silence
+from .audio import decode_audio, is_silence
 from .config import Settings
-from .models import ChunkTask, SubtitlePayload, Transcript
+from .models import ChunkTask, SubtitlePayload
 from .services import Database, EventBus, ObjectStorage
 logger = logging.getLogger(__name__)
 
 MIN_IDLE_MS = 30_000
 CLAIM_COUNT = 10
+# 单条消息最大处理尝试次数：超过后判定为毒消息（poison message），
+# 记录到死信 Stream 并 ACK，避免某分片永久阻塞 / 刷日志。
+MAX_DELIVERY_ATTEMPTS = 5
+DEAD_LETTER_STREAM = "asr:deadletter"
 
 
 class Consumer:
@@ -125,9 +129,46 @@ class Consumer:
                 "processed session=%s seq=%d in %.0fms (ack %s)",
                 task.session_id, task.seq, (time.time() - started) * 1000, message_id,
             )
-        except Exception:
+        except Exception as exc:
             self.stats["failed"] += 1
             logger.exception("process failed session=%s seq=%s", task.session_id, task.seq)
+            # 达到投递上限：转入死信 Stream 并 ACK，避免毒消息无限重投。
+            if self._delivery_count(message_id) >= MAX_DELIVERY_ATTEMPTS:
+                logger.error(
+                    "message %s session=%s seq=%s exceeded %d attempts -> dead letter: %v",
+                    message_id, task.session_id, task.seq, MAX_DELIVERY_ATTEMPTS, exc,
+                )
+                self._move_to_dead_letter(message_id, raw, str(exc))
+                self.redis.xack(
+                    self.settings.redis_stream, self.settings.redis_group, message_id)
+                self.stats["deadletter"] = self.stats.get("deadletter", 0) + 1
+
+    def _delivery_count(self, message_id: str) -> int:
+        """返回某消息在消费组内的投递次数（delivery counter，每次认领递增）。"""
+        try:
+            rows = self.redis.xpending_range(
+                self.settings.redis_stream,
+                self.settings.redis_group,
+                min=message_id,
+                max=message_id,
+                count=1,
+            )
+            if rows:
+                return int(rows[0].get("times_delivered", 0))
+        except redis.RedisError as exc:
+            logger.debug("xpending_range failed: %s", exc)
+        return 1
+
+    def _move_to_dead_letter(self, message_id: str, raw: str, error: str) -> None:
+        try:
+            self.redis.xadd(
+                DEAD_LETTER_STREAM,
+                {"data": raw, "originalId": message_id, "error": error[:500]},
+                maxlen=1000,
+                approximate=True,
+            )
+        except redis.RedisError as exc:
+            logger.error("write dead letter stream failed: %s", exc)
 
     def process(self, task: ChunkTask) -> None:
         received_ms = time.time_ns() // 1_000_000
@@ -141,9 +182,14 @@ class Consumer:
         # --- partial 通道：低算力转写，尽快上屏（不翻译、不落库）---
         if self.settings.enable_partial and not is_silence(pcm):
             partial_started = time.time()
-            partial = self._transcribe_safe(pcm, task.language, final=False, seq=task.seq)
+            # partial 容错：失败不影响 final 权威结果。
+            try:
+                partial = self.asr.transcribe(pcm, task.language, final=False, seq=task.seq)
+            except Exception:
+                logger.exception("partial ASR failed seq=%s (continuing to final)", task.seq)
+                partial = None
             partial_ms = int((time.time() - partial_started) * 1000)
-            if partial.text.strip():
+            if partial is not None and partial.text.strip():
                 emitted = time.time_ns() // 1_000_000
                 self.bus.publish_subtitle(SubtitlePayload(
                     sessionId=task.session_id,
@@ -163,12 +209,21 @@ class Consumer:
 
         # --- final 通道：高质量转写 + 翻译 + 持久化 ---
         final_started = time.time()
-        final = self._transcribe_safe(pcm, task.language, final=True, seq=task.seq)
+        # 真实异常向上抛出（不吞成空字幕）：消息不 ACK，由 XAUTOCLAIM 重投；
+        # 连续失败可由后续死信策略处理。仅“确实没有语音”才得到空文本。
+        final = self.asr.transcribe(pcm, task.language, final=True, seq=task.seq)
         asr_ms = int((time.time() - final_started) * 1000)
 
-        translations: dict[str, str] = {}
         text = final.text.strip()
-        if text and task.targets:
+        if not text:
+            # 空 final（静音切片）不落库、不推送，避免空字幕覆盖时间轴。
+            logger.info("empty final transcript skipped session=%s seq=%d asrMs=%d",
+                        task.session_id, task.seq, asr_ms)
+            self.stats["empty"] = self.stats.get("empty", 0) + 1
+            return
+
+        translations: dict[str, str] = {}
+        if task.targets:
             translations = self.translator.translate(text, final.language, task.targets)
 
         emitted = time.time_ns() // 1_000_000
@@ -191,12 +246,3 @@ class Consumer:
         # 先持久化再广播：REST/重连回放与实时推送看到的状态一致。
         self.database.upsert_subtitle(payload)
         self.bus.publish_subtitle(payload)
-
-    def _transcribe_safe(self, pcm, language: str, final: bool, seq: int) -> Transcript:
-        try:
-            return self.asr.transcribe(pcm, language, final=final, seq=seq)
-        except AudioDecodeError:
-            raise
-        except Exception as exc:
-            logger.exception("ASR transcription failed seq=%s final=%s", seq, final)
-            return Transcript(text="", language=language, confidence=0.0)

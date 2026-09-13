@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
-import type { SessionInfo } from "../lib/types";
+import { buildViewerLink, saveTokens } from "../lib/tokens";
 
 const LANGUAGES: Record<string, string> = {
   zh: "中文",
@@ -13,25 +13,44 @@ const LANGUAGES: Record<string, string> = {
   es: "Español",
 };
 
+interface RecentSession {
+  id: string;
+  sourceLanguage: string;
+  targetLanguages: string[];
+  createdAt: string;
+  hasHostToken: boolean;
+}
+
+const RECENT_KEY = "lsp:recent";
+
+function loadRecent(): RecentSession[] {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]") as RecentSession[];
+  } catch {
+    return [];
+  }
+}
+
+function pushRecent(session: RecentSession) {
+  const all = [session, ...loadRecent().filter((item) => item.id !== session.id)].slice(0, 10);
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(all));
+  } catch {
+    /* ignore */
+  }
+}
+
 export default function HomePage() {
   const navigate = useNavigate();
   const [sourceLanguage, setSourceLanguage] = useState("zh");
   const [targets, setTargets] = useState<string[]>(["en"]);
   const [creating, setCreating] = useState(false);
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sessions, setSessions] = useState<RecentSession[]>([]);
   const [error, setError] = useState("");
-
-  async function refresh() {
-    try {
-      const result = await api.listSessions(10);
-      setSessions(result.sessions);
-    } catch {
-      /* 网关未启动时首页仍可用 */
-    }
-  }
+  const [viewerLink, setViewerLink] = useState("");
 
   useEffect(() => {
-    void refresh();
+    setSessions(loadRecent());
   }, []);
 
   function toggleTarget(code: string) {
@@ -51,7 +70,28 @@ export default function HomePage() {
         sampleRate: 16000,
         channels: 1,
       });
-      navigate(role === "broadcaster" ? `/broadcast/${session.id}` : `/watch/${session.id}`);
+      if (!session.hostToken || !session.viewToken) {
+        throw new Error("网关未返回访问令牌");
+      }
+      saveTokens(session.id, {
+        hostToken: session.hostToken,
+        viewToken: session.viewToken,
+      });
+      pushRecent({
+        id: session.id,
+        sourceLanguage: session.sourceLanguage,
+        targetLanguages: session.targetLanguages ?? [],
+        createdAt: session.createdAt,
+        hasHostToken: true,
+      });
+      setViewerLink(
+        buildViewerLink(session.id, session.viewToken),
+      );
+      navigate(
+        role === "broadcaster"
+          ? `/broadcast/${session.id}`
+          : `/watch/${session.id}?token=${encodeURIComponent(session.viewToken)}`,
+      );
     } catch (exc) {
       setError((exc as Error).message);
     } finally {
@@ -122,20 +162,20 @@ export default function HomePage() {
             👀 以观众身份进入
           </button>
         </div>
+        {viewerLink && (
+          <p className="mt-3 break-all text-xs text-slate-500">
+            观众邀请链接：{viewerLink}
+          </p>
+        )}
       </section>
 
       <section className="mt-8">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-            最近会话
-          </h2>
-          <button onClick={refresh} className="text-xs text-brand-500 hover:underline">
-            刷新
-          </button>
-        </div>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-500">
+          本机最近会话（令牌保存在本浏览器）
+        </h2>
         <div className="space-y-2">
           {sessions.length === 0 && (
-            <p className="text-sm text-slate-600">暂无会话（需要网关在线）。</p>
+            <p className="text-sm text-slate-600">暂无本机会话记录。</p>
           )}
           {sessions.map((session) => (
             <div

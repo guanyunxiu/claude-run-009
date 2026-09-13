@@ -26,7 +26,13 @@ const MAX_FINALS = 500;
  *  - 指数退避断线重连，重连时用 replay 让网关回放缺失 final
  *  - 按 seq+startMs 排序、去重；final 覆盖同 seq 的 partial
  */
-export function useSubtitles(sessionId: string | undefined) {
+export interface UseSubtitlesOptions {
+  /** 访问令牌（hostToken 或 viewToken）。 */
+  token?: string;
+}
+
+export function useSubtitles(sessionId: string | undefined, options?: UseSubtitlesOptions) {
+  const token = options?.token ?? "";
   const [state, setState] = useState<SubtitleState>({
     finals: [],
     partialBySeq: new Map(),
@@ -115,8 +121,8 @@ export function useSubtitles(sessionId: string | undefined) {
       reconnectAttempts: attemptsRef.current,
     }));
 
-    // 重连时通过 replay 补齐断线期间落库的 final（网关返回最近 20 条）。
-    const ws = new WebSocket(api.wsUrl(sessionId, isReconnect ? 50 : 20));
+    // 重连时通过 replay 补齐断线期间落库的 final（网关返回最近 50 条）。
+    const ws = new WebSocket(api.wsUrl(sessionId, token, isReconnect ? 50 : 20));
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -139,12 +145,27 @@ export function useSubtitles(sessionId: string | undefined) {
         return;
       }
       attemptsRef.current += 1;
+      const attempt = attemptsRef.current;
       // 指数退避：1s, 2s, 4s ... 上限 15s。
-      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(attemptsRef.current - 1, 4));
+      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(attempt - 1, 4));
       setState((prev) => ({ ...prev, connection: "reconnecting" }));
-      timerRef.current = window.setTimeout(connect, delay);
+      timerRef.current = window.setTimeout(async () => {
+        // 重连前核查会话状态：若期间直播已结束（错过 session-end），
+        // 立即停止，不再无限重连。
+        try {
+          const info = await api.getSession(sessionId, { token });
+          if (info.status === "ended") {
+            closedByUserRef.current = true;
+            setState((prev) => ({ ...prev, connection: "closed", sessionEnded: true }));
+            return;
+          }
+        } catch {
+          // 接口暂时不可用（网关重启中）：继续退避重连 WS，由重连本身补发。
+        }
+        connect();
+      }, delay);
     };
-  }, [sessionId, applyMessage]);
+  }, [sessionId, token, applyMessage]);
 
   useEffect(() => {
     if (!sessionId) return;

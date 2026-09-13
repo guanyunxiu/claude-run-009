@@ -3,6 +3,8 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -20,7 +22,7 @@ func newHubWithMiniRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client, *Hu
 		t.Fatalf("miniredis: %v", err)
 	}
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	hub := NewHub(rdb, "subtitles")
+	hub := NewHub(rdb, "subtitles", []string{"*"}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go hub.RunPubSub(ctx)
 	t.Cleanup(func() {
@@ -142,5 +144,60 @@ func TestHubReplayOrderedAscending(t *testing.T) {
 		if msg.StartMs != wantOrder[i] {
 			t.Errorf("replay[%d] startMs = %d, want %d", i, msg.StartMs, wantOrder[i])
 		}
+	}
+}
+
+// ---- Origin 校验（修复 CheckOrigin 恒放行）----
+
+func originRequest(origin, host string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/x/subtitles/ws", nil)
+	req.Host = host
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	return req
+}
+
+func TestOriginWildcardAcceptsBrowser(t *testing.T) {
+	_, rdb, hub, _ := newHubWithMiniRedis(t)
+	_ = rdb
+	hub.allowedOrigin = map[string]bool{"*": true}
+	if !hub.originAllowed(originRequest("https://evil.example", "live.example.com")) {
+		t.Fatal("wildcard should accept any browser origin (explicit opt-in)")
+	}
+}
+
+func TestOriginSameHostAccepted(t *testing.T) {
+	hub := NewHub(nil, "subtitles", nil, nil) // 默认：仅同源
+	req := originRequest("https://live.example.com", "live.example.com")
+	if !hub.originAllowed(req) {
+		t.Fatal("same-origin should be accepted")
+	}
+}
+
+func TestOriginCrossSiteRejected(t *testing.T) {
+	hub := NewHub(nil, "subtitles", nil, nil)
+	req := originRequest("https://evil.example.com", "live.example.com")
+	if hub.originAllowed(req) {
+		t.Fatal("cross-site origin must be rejected")
+	}
+}
+
+func TestOriginWhitelistMatched(t *testing.T) {
+	hub := NewHub(nil, "subtitles",
+		[]string{"https://live.example.com", "https://studio.example.com"}, nil)
+	if !hub.originAllowed(originRequest("https://studio.example.com", "api.internal:8080")) {
+		t.Fatal("whitelisted origin should be accepted even with different Host")
+	}
+	if hub.originAllowed(originRequest("https://evil.example.com", "api.internal:8080")) {
+		t.Fatal("non-whitelisted origin must be rejected")
+	}
+}
+
+func TestOriginAbsentAcceptedForNonBrowser(t *testing.T) {
+	hub := NewHub(nil, "subtitles", nil, nil)
+	// curl / 服务端客户端不带 Origin：放行（令牌本身负责鉴权）。
+	if !hub.originAllowed(originRequest("", "live.example.com")) {
+		t.Fatal("requests without Origin (non-browser) should be accepted")
 	}
 }

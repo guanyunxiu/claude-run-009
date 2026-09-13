@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+
+	"github.com/livesub/gateway/internal/model"
 )
 
 // Client 单条 WebSocket 连接。
@@ -47,18 +50,36 @@ func (c *Client) shutdown() {
 	}
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(_ *http.Request) bool { return true },
-}
-
 // HandleWS 处理 GET /api/v1/sessions/:id/subtitles/ws
-// 查询参数 replay=<n> 表示连接建立时回放最近 n 条 final 字幕。
+// 查询参数：
+//   - replay=<n> 连接建立时回放最近 n 条 final 字幕；
+//   - token=<viewToken|hostToken> 浏览器 WS 无法设置 Authorization 头时使用
+//     （已在路由中间件完成校验）。
 func (h *Hub) HandleWS(ctx *gin.Context) {
 	sessionID := ctx.Param("id")
 
-	conn, err := upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+	// Origin 白名单 / 同源校验（中间件已校验令牌身份）。
+	if !h.originAllowed(ctx.Request) {
+		ctx.AbortWithStatus(http.StatusForbidden)
+		log.Printf("websocket rejected: origin not allowed session=%s origin=%q",
+			sessionID, ctx.GetHeader("Origin"))
+		return
+	}
+
+	// 会话已结束：仍允许握手，先补发 session-end 再关闭，
+	// 解决“断线期间错过 session-end 导致无限重连”。
+	ended := false
+	if status, err := h.SessionStatus(ctx.Request.Context(), sessionID); err == nil && status == "ended" {
+		ended = true
+	}
+
+	// Origin 已在上方显式校验；这里使用局部 upgrader（无全局可变状态）。
+	up := websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin:     func(_ *http.Request) bool { return true },
+	}
+	conn, err := up.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		log.Printf("websocket upgrade: %v", err)
 		return
@@ -82,6 +103,18 @@ func (h *Hub) HandleWS(ctx *gin.Context) {
 
 	go client.writePump()
 	go client.readPump(h, sessionID)
+
+	if ended {
+		endPayload, _ := json.Marshal(model.SessionEndMessage{
+			Type: "session-end", SessionID: sessionID, AtMs: time.Now().UnixMilli(),
+		})
+		client.deliver(endPayload)
+		// 给 writePump 一点时间把消息发出去再关连接。
+		time.AfterFunc(500*time.Millisecond, func() {
+			h.Unsubscribe(sessionID, client)
+			_ = conn.Close()
+		})
+	}
 }
 
 func (c *Client) readPump(h *Hub, sessionID string) {

@@ -9,6 +9,9 @@ export interface SessionInfo {
   createdAt: string;
   endedAt?: string;
   wsUrl?: string;
+  /** 仅创建会话的响应中一次性返回 */
+  hostToken?: string;
+  viewToken?: string;
 }
 
 export interface CreateSessionRequest {

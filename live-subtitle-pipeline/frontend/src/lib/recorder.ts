@@ -21,6 +21,14 @@ export type ChunkHandler = (chunk: PcmChunk) => void | Promise<void>;
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SECONDS = 3;
 
+export interface RecorderOptions {
+  /** 是否同时采集摄像头视频轨（主播画面预览）。默认 true。 */
+  video?: boolean;
+  videoWidth?: number;
+  videoHeight?: number;
+  facingMode?: "user" | "environment";
+}
+
 export class AudioRecorder {
   private ctx: AudioContext | null = null;
   private node: AudioWorkletNode | ScriptProcessorNode | null = null;
@@ -30,16 +38,38 @@ export class AudioRecorder {
   private fallbackSamples = 0;
   private fallbackSeq = 0;
   private fallbackAnchor = 0;
+  private hasVideo = false;
 
-  async start(onChunk: ChunkHandler): Promise<void> {
-    this.stream = await navigator.mediaDevices.getUserMedia({
+  async start(onChunk: ChunkHandler, options: RecorderOptions = {}): Promise<void> {
+    const wantVideo = options.video !== false;
+    const constraints: MediaStreamConstraints = {
       audio: {
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
       },
-    });
+    };
+
+    if (wantVideo) {
+      constraints.video = {
+        width: { ideal: options.videoWidth ?? 1280 },
+        height: { ideal: options.videoHeight ?? 720 },
+        facingMode: options.facingMode ?? "user",
+      };
+    }
+
+    try {
+      // 优先音视频一起请求（单次授权）。
+      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+      this.hasVideo = this.stream.getVideoTracks().length > 0;
+    } catch (videoErr) {
+      if (!wantVideo) throw videoErr;
+      // 摄像头被占用/无设备/被拒绝时，降级为纯音频，保证字幕链路可用。
+      console.warn("video unavailable, falling back to audio-only:", videoErr);
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: constraints.audio });
+      this.hasVideo = false;
+    }
 
     const AudioContextCtor =
       window.AudioContext ??
@@ -84,12 +114,22 @@ export class AudioRecorder {
     this.node = null;
     this.stream = null;
     this.mediaSource = null;
+    this.hasVideo = false;
     this.fallbackBuffer = [];
     this.fallbackSamples = 0;
   }
 
   get running(): boolean {
     return this.ctx?.state === "running";
+  }
+
+  /** 供 <video> 元素做本地预览的实时流（含视频轨；无摄像头时仅含音频）。 */
+  get mediaStream(): MediaStream | null {
+    return this.stream;
+  }
+
+  get videoActive(): boolean {
+    return this.hasVideo;
   }
 
   private _startScriptProcessor(onChunk: ChunkHandler) {

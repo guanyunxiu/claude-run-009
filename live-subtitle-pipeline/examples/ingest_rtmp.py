@@ -35,9 +35,13 @@ CHUNK_BYTES = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * CHUNK_SECONDS
 
 
 def http_json(method: str, url: str, body: bytes | None = None,
-              content_type: str = "application/json") -> dict:
+              content_type: str = "application/json",
+              token: str | None = None) -> dict:
     request = urllib.request.Request(url, data=body, method=method)
     request.add_header("Content-Type", content_type)
+    if token:
+        # 写接口只走 Authorization 头，令牌不出现在 URL/日志中。
+        request.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
@@ -46,7 +50,8 @@ def http_json(method: str, url: str, body: bytes | None = None,
         raise SystemExit(f"HTTP {exc.code} for {url}: {detail}") from exc
 
 
-def create_session(gateway: str, language: str, targets: list[str]) -> str:
+def create_session(gateway: str, language: str, targets: list[str]) -> tuple[str, str]:
+    """返回 (session_id, host_token)。"""
     payload = json.dumps({
         "sourceLanguage": language,
         "targetLanguages": targets,
@@ -56,20 +61,22 @@ def create_session(gateway: str, language: str, targets: list[str]) -> str:
     }).encode()
     result = http_json("POST", f"{gateway}/api/v1/sessions", payload)
     print(f"session created: {result['id']}")
-    return result["id"]
+    if not result.get("hostToken"):
+        raise SystemExit("gateway did not return hostToken (incompatible version)")
+    return result["id"], result["hostToken"]
 
 
-def upload_chunk(gateway: str, session_id: str, seq: int, start_ms: int,
+def upload_chunk(gateway: str, session_id: str, host_token: str, seq: int, start_ms: int,
                  end_ms: int, pcm: bytes) -> None:
     url = (
         f"{gateway}/api/v1/sessions/{quote(session_id)}/chunks"
         f"?seq={seq}&startMs={start_ms}&endMs={end_ms}"
     )
-    http_json("POST", url, pcm, content_type="audio/pcm")
+    http_json("POST", url, pcm, content_type="audio/pcm", token=host_token)
 
 
 def ingest(source: str, gateway: str, language: str, targets: list[str]) -> None:
-    session_id = create_session(gateway, language, targets)
+    session_id, host_token = create_session(gateway, language, targets)
 
     # -fflags +genpts 处理 HLS；-re 按实时速率（拉直播源时源本身即实时）。
     command = [
@@ -94,9 +101,9 @@ def ingest(source: str, gateway: str, language: str, targets: list[str]) -> None
             end_ms = start_ms + round(len(pcm) / SAMPLE_RATE / BYTES_PER_SAMPLE * 1000)
             if len(pcm) < CHUNK_BYTES:
                 # 最后一小段不足 3s，仍上传后结束。
-                upload_chunk(gateway, session_id, seq, start_ms, end_ms, pcm)
+                upload_chunk(gateway, session_id, host_token, seq, start_ms, end_ms, pcm)
                 break
-            upload_chunk(gateway, session_id, seq, start_ms, end_ms, pcm)
+            upload_chunk(gateway, session_id, host_token, seq, start_ms, end_ms, pcm)
             print(f"  uploaded seq={seq} bytes={len(pcm)}")
             seq += 1
     except KeyboardInterrupt:
@@ -104,7 +111,8 @@ def ingest(source: str, gateway: str, language: str, targets: list[str]) -> None
     finally:
         proc.terminate()
         try:
-            http_json("POST", f"{gateway}/api/v1/sessions/{session_id}/end")
+            http_json("POST", f"{gateway}/api/v1/sessions/{session_id}/end",
+                      token=host_token)
         except Exception as exc:  # noqa: BLE001
             print(f"end session failed: {exc}", file=sys.stderr)
         print(f"session ended: {session_id}, total chunks={seq}")

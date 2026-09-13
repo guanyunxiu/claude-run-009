@@ -9,10 +9,27 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/livesub/gateway/internal/auth"
 	"github.com/livesub/gateway/internal/config"
 )
 
-// 不依赖外部服务：用 miniredis + nil db/store 只验证纯参数校验与路由层行为。
+// fakeLookup 测试用令牌反查：<token> 直接映射到 <sessionID>:<role>。
+type fakeLookup struct{}
+
+func (fakeLookup) IdentityByToken(token string) (*auth.SessionIdentity, error) {
+	switch token {
+	case "host-token-x":
+		return &auth.SessionIdentity{SessionID: "x", Role: auth.RoleHost}, nil
+	case "view-token-x":
+		return &auth.SessionIdentity{SessionID: "x", Role: auth.RoleView}, nil
+	case "host-token-y":
+		return &auth.SessionIdentity{SessionID: "y", Role: auth.RoleHost}, nil
+	default:
+		return nil, nil
+	}
+}
+
+// 不依赖外部服务：用 miniredis + 鉴权桩验证路由层行为。
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	mr, err := miniredis.Run()
@@ -27,7 +44,14 @@ func newTestServer(t *testing.T) *Server {
 		CORSOrigins:  []string{"*"},
 		MaxAudioSize: 1 << 20,
 	}
-	return NewServer(cfg, nil, rdb, nil, nil)
+	s := NewServer(cfg, nil, rdb, nil, nil)
+	s.SetTokenLookupForTest(fakeLookup{})
+	return s
+}
+
+func withBearer(req *http.Request, token string) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+token)
+	return req
 }
 
 func TestCreateSessionInvalidJSON(t *testing.T) {
@@ -41,13 +65,96 @@ func TestCreateSessionInvalidJSON(t *testing.T) {
 	}
 }
 
+// 无令牌访问受保护资源 -> 401。
+func TestProtectedRoutesRequireToken(t *testing.T) {
+	server := newTestServer(t)
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/sessions/x"},
+		{http.MethodGet, "/api/v1/sessions/x/subtitles"},
+		{http.MethodPost, "/api/v1/sessions/x/chunks?seq=1&startMs=0&endMs=3000"},
+		{http.MethodPost, "/api/v1/sessions/x/end"},
+	}
+	for _, tc := range cases {
+		w := httptest.NewRecorder()
+		req := withBearer(httptest.NewRequest(tc.method, tc.path, strings.NewReader("0000")), "")
+		req.Header.Del("Authorization")
+		server.Router().ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s -> %d, want 401", tc.method, tc.path, w.Code)
+		}
+	}
+}
+
+// 伪造/无效令牌 -> 401。
+func TestInvalidTokenRejected(t *testing.T) {
+	server := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := withBearer(
+		httptest.NewRequest(http.MethodGet, "/api/v1/sessions/x", nil), "nonsense")
+	server.Router().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+// 观众令牌不能访问主播接口（上传/结束）-> 403。
+func TestViewTokenCannotUploadOrEnd(t *testing.T) {
+	server := newTestServer(t)
+
+	w := httptest.NewRecorder()
+	req := withBearer(httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/x/end", nil), "view-token-x")
+	server.Router().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("end with view token -> %d, want 403", w.Code)
+	}
+
+	w2 := httptest.NewRecorder()
+	req2 := withBearer(httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/x/chunks?startMs=0&endMs=3000", strings.NewReader("0000")), "view-token-x")
+	req2.Header.Set("Content-Type", "audio/pcm")
+	server.Router().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusForbidden {
+		t.Fatalf("upload with view token -> %d, want 403", w2.Code)
+	}
+}
+
+// A 会话的令牌不能用于 B 会话 -> 401。
+func TestTokenScopedToSession(t *testing.T) {
+	server := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := withBearer(
+		httptest.NewRequest(http.MethodGet, "/api/v1/sessions/y", nil), "view-token-x")
+	server.Router().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-session token -> %d, want 401", w.Code)
+	}
+}
+
+// 未配置 API key 时，列会话接口直接 404（不暴露存在性）。
+func TestListSessionsHiddenWithoutAPIKey(t *testing.T) {
+	server := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil)
+	server.Router().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("list sessions -> %d, want 404", w.Code)
+	}
+}
+
+// 鉴权通过后，参数校验才执行：缺 seq 返回 400（而非 401）。
 func TestUploadChunkMissingSeq(t *testing.T) {
 	server := newTestServer(t)
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost,
-		"/api/v1/sessions/x/chunks?startMs=0&endMs=3000", strings.NewReader("0000"))
+	req := withBearer(httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/x/chunks?startMs=0&endMs=3000", strings.NewReader("0000")), "host-token-x")
 	req.Header.Set("Content-Type", "audio/pcm")
 	server.Router().ServeHTTP(w, req)
+	// 鉴权通过，但 db 为 nil：走到 DB 查询会 500（参数校验先于 DB）。
+	// 缺 seq 在鉴权后立即 400。
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (missing seq)", w.Code)
 	}
@@ -56,8 +163,8 @@ func TestUploadChunkMissingSeq(t *testing.T) {
 func TestUploadChunkInvertedRange(t *testing.T) {
 	server := newTestServer(t)
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost,
-		"/api/v1/sessions/x/chunks?seq=1&startMs=3000&endMs=1000", strings.NewReader("0000"))
+	req := withBearer(httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/x/chunks?seq=1&startMs=3000&endMs=1000", strings.NewReader("0000")), "host-token-x")
 	req.Header.Set("Content-Type", "audio/pcm")
 	server.Router().ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {

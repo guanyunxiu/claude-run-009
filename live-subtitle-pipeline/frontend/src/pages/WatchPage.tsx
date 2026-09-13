@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import type { SessionInfo } from "../lib/types";
+import { resolveToken } from "../lib/tokens";
 import { useSubtitles } from "../lib/useSubtitles";
 import { ConnectionBadge } from "../components/ConnectionBadge";
 import { LatencyMeter } from "../components/LatencyMeter";
@@ -14,15 +15,25 @@ export default function WatchPage() {
   const [error, setError] = useState("");
   const [targetLang, setTargetLang] = useState<string>("");
 
-  const subtitles = useSubtitles(id);
+  // 观众令牌：来自主播分享链接 ?token=<viewToken>，或本机已保存的令牌。
+  const token = useMemo(
+    () => resolveToken(id, "view", new URLSearchParams(window.location.search).get("token")),
+    [id],
+  );
+
+  const subtitles = useSubtitles(id, { token });
   const lastFinal = subtitles.finals[subtitles.finals.length - 1] ?? null;
 
   useEffect(() => {
-    api.getSession(id).then((info) => {
+    if (!token) {
+      setError("缺少观众令牌（viewToken）。请使用主播分享的邀请链接进入。");
+      return;
+    }
+    api.getSession(id, { token }).then((info) => {
       setSession(info);
       setTargetLang(info.targetLanguages?.[0] ?? "");
     }).catch((exc) => setError((exc as Error).message));
-  }, [id]);
+  }, [id, token]);
 
   const recentFinals = useMemo(
     () => subtitles.finals.slice(-30).reverse(),

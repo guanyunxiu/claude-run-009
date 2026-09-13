@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -21,21 +23,36 @@ const (
 	pingPeriod     = 50 * time.Second
 )
 
+// SessionStatusChecker 查询会话当前状态（active/ended）。
+type SessionStatusChecker interface {
+	SessionStatus(ctx context.Context, sessionID string) (status string, err error)
+}
+
 // Hub 维护每个会话的 WebSocket 订阅者，并把 Redis Pub/Sub 的字幕
 // （由 ASR worker 发布）扇出给本机连接。网关无状态、可水平扩展。
 type Hub struct {
-	rdb          *redis.Client
-	pubsubPrefix string
+	rdb           *redis.Client
+	pubsubPrefix  string
+	allowedOrigin map[string]bool // 显式允许的 Origin（host:port）；为空表示同源放行
+	statusChecker SessionStatusChecker
 
 	mu          sync.RWMutex
 	subscribers map[string]map[*Client]struct{}
 }
 
-func NewHub(rdb *redis.Client, pubsubPrefix string) *Hub {
+// NewHub 创建 Hub。origins 为允许的浏览器 Origin 主机列表；
+// 传 "*" 或空切片表示仅允许与 Host 同源的 Origin（拒绝跨站 WebSocket 握手）。
+func NewHub(rdb *redis.Client, pubsubPrefix string, origins []string, checker SessionStatusChecker) *Hub {
+	allowed := make(map[string]bool, len(origins))
+	for _, origin := range origins {
+		allowed[strings.ToLower(strings.TrimSpace(origin))] = true
+	}
 	return &Hub{
-		rdb:          rdb,
-		pubsubPrefix: pubsubPrefix,
-		subscribers:  make(map[string]map[*Client]struct{}),
+		rdb:           rdb,
+		pubsubPrefix:  pubsubPrefix,
+		allowedOrigin: allowed,
+		statusChecker: checker,
+		subscribers:   make(map[string]map[*Client]struct{}),
 	}
 }
 
@@ -101,6 +118,41 @@ func (h *Hub) Replay(ctx context.Context, sessionID string, limit int64) ([][]by
 
 func (h *Hub) channel(sessionID string) string {
 	return h.pubsubPrefix + ":" + sessionID
+}
+
+// originAllowed 校验 WebSocket 握手来源，拒绝浏览器里的跨站脚本。
+//   - 无 Origin 头：非浏览器客户端（curl/服务端）放行；
+//   - 配置了 "*"：显式放行全部（仅限开发，与 CORS 语义一致）；
+//   - 配置了显式白名单：必须精确匹配 scheme://host[:port]；
+//   - 默认：只允许与请求 Host 同源（scheme 跟随 X-Forwarded-Proto/请求 TLS）。
+func (h *Hub) originAllowed(req *http.Request) bool {
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if h.allowedOrigin["*"] {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	if h.allowedOrigin[strings.ToLower(origin)] {
+		return true
+	}
+	// 同源：Origin 的 host 与 Host 头一致。
+	if !strings.EqualFold(parsed.Host, req.Host) {
+		return false
+	}
+	return true
+}
+
+// SessionStatus 透传给连接建立时的会话状态检查（handler 使用）。
+func (h *Hub) SessionStatus(ctx context.Context, sessionID string) (string, error) {
+	if h.statusChecker == nil {
+		return "active", nil
+	}
+	return h.statusChecker.SessionStatus(ctx, sessionID)
 }
 
 // RunPubSub 订阅所有会话频道（模式订阅），把消息扇出给本地连接。

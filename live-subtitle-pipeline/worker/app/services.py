@@ -23,7 +23,7 @@ class ObjectStorage:
     def __init__(self, settings: Settings) -> None:
         self.client = boto3.client(
             "s3",
-            endpoint_uri=(
+            endpoint_url=(
                 f"https://{settings.minio_endpoint}" if settings.minio_secure
                 else f"http://{settings.minio_endpoint}"
             ),
