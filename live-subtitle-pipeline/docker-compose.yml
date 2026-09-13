@@ -1,0 +1,174 @@
+# 直播实时字幕与多语言翻译流水线
+# Live Real-time Captioning & Multilingual Translation Pipeline
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lsp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-subtitle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-subtitle}
+      POSTGRES_DB: ${POSTGRES_DB:-subtitles}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-subtitle}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: lsp-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    container_name: lsp-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  createbuckets:
+    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb --ignore-existing local/${MINIO_BUCKET:-audio-chunks};
+      mc anonymous set download local/${MINIO_BUCKET:-audio-chunks} || true;
+      echo 'bucket ready';
+      "
+
+  gateway:
+    build:
+      context: ./gateway
+    container_name: lsp-gateway
+    restart: unless-stopped
+    environment:
+      GATEWAY_ADDR: ":8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-subtitle}:${POSTGRES_PASSWORD:-subtitle}@postgres:5432/${POSTGRES_DB:-subtitles}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-audio-chunks}
+      CORS_ORIGINS: "*"
+      MAX_AUDIO_BYTES: "1048576"
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+
+  asr-worker:
+    build:
+      context: ./worker
+      args:
+        # 完整镜像（含 faster-whisper，体积较大）: --build-arg ASR_PROVIDER=whisper
+        ASR_PROVIDER: ${ASR_PROVIDER:-stub}
+    image: lsp-asr-worker:latest
+    container_name: lsp-asr-worker
+    restart: unless-stopped
+    environment:
+      WORKER_ID: worker-1
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM: asr:tasks
+      REDIS_GROUP: asr-workers
+      DATABASE_URL: postgres://${POSTGRES_USER:-subtitle}:${POSTGRES_PASSWORD:-subtitle}@postgres:5432/${POSTGRES_DB:-subtitles}?sslmode=disable
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-audio-chunks}
+      MINIO_SECURE: "false"
+      ASR_PROVIDER: ${ASR_PROVIDER:-stub}
+      ASR_MODEL: ${ASR_MODEL:-small}
+      ASR_DEVICE: ${ASR_DEVICE:-cpu}
+      ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-zh}
+      TRANSLATE_PROVIDER: ${TRANSLATE_PROVIDER:-stub}
+      LIBRETRANSLATE_URL: ${LIBRETRANSLATE_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+
+  # 可横向扩展的第二个 worker（同消费组，分摊不同分片）
+  asr-worker-2:
+    image: lsp-asr-worker:latest
+    profiles: ["scale"]
+    container_name: lsp-asr-worker-2
+    restart: unless-stopped
+    environment:
+      WORKER_ID: worker-2
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM: asr:tasks
+      REDIS_GROUP: asr-workers
+      DATABASE_URL: postgres://${POSTGRES_USER:-subtitle}:${POSTGRES_PASSWORD:-subtitle}@postgres:5432/${POSTGRES_DB:-subtitles}?sslmode=disable
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-audio-chunks}
+      MINIO_SECURE: "false"
+      ASR_PROVIDER: ${ASR_PROVIDER:-stub}
+      ASR_MODEL: ${ASR_MODEL:-small}
+      ASR_DEVICE: ${ASR_DEVICE:-cpu}
+      ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-zh}
+      TRANSLATE_PROVIDER: ${TRANSLATE_PROVIDER:-stub}
+    depends_on:
+      - asr-worker
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: ""
+    container_name: lsp-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8081}:80"
+    depends_on:
+      - gateway
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

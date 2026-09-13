@@ -1,0 +1,21 @@
+# ---- Web / ASR worker 运行时 ----
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# ---- 队列 / 存储 ----
+redis==5.0.8
+boto3==1.35.24
+psycopg[binary]==3.2.2
+
+# ---- 音频 ----
+numpy==1.26.4
+
+# ---- ASR（默认镜像走 stub，不安装以下重型依赖）----
+# 通过 Docker build-arg ASR_PROVIDER=whisper 安装：
+# faster-whisper==1.0.3
+# ctranslate2==4.4.0
+
+# ---- HTTP 翻译 ----
+httpx==0.27.2
