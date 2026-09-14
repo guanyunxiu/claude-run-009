@@ -8,6 +8,7 @@ import { useSubtitles } from "../lib/useSubtitles";
 import { usePipelineStatus } from "../lib/usePipelineStatus";
 import { ConnectionBadge } from "../components/ConnectionBadge";
 import { InviteLink } from "../components/InviteLink";
+import { IngestPanel } from "../components/IngestPanel";
 import { LatencyMeter } from "../components/LatencyMeter";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 
@@ -146,7 +147,13 @@ export default function BroadcastPage() {
 
   useEffect(() => () => recorderRef.current?.stop(), []);
 
-  const targetLang = session?.targetLanguages?.[0];
+  // 主播台多语言：可切换显示目标语言，并支持源语/译文对照。
+  const targets = session?.targetLanguages ?? [];
+  const [targetLang, setTargetLang] = useState<string>("");
+  const [dualView, setDualView] = useState(false);
+  useEffect(() => {
+    setTargetLang((cur) => cur || targets[0] || "");
+  }, [targets.join(",")]);
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
@@ -196,6 +203,7 @@ export default function BroadcastPage() {
           partial={subtitles.currentPartial}
           lastFinal={lastFinal}
           targetLang={targetLang}
+          dual={dualView}
         />
       </div>
 
@@ -265,12 +273,54 @@ export default function BroadcastPage() {
         </p>
       )}
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
         <Metric label="已传分片" value={String(stat.chunks)} />
         <Metric label="传输中" value={String(stat.inFlight)} />
         <Metric label="失败" value={String(stat.failed)} danger={stat.failed > 0} />
         <Metric label="最近 seq" value={stat.lastSeq === null ? "—" : `#${stat.lastSeq}`} />
         <Metric label="上传字节" value={formatBytes(stat.bytes)} />
+      </div>
+
+      {targets.length > 0 && (
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-slate-500">字幕语言：</span>
+          <button
+            onClick={() => setTargetLang("")}
+            className={`rounded-full border px-3 py-1 text-xs ${
+              targetLang === "" ? "border-brand-500 text-white" : "border-slate-700 text-slate-400"
+            }`}
+          >
+            原文（{session?.sourceLanguage ?? "?"}）
+          </button>
+          {targets.map((code) => (
+            <button
+              key={code}
+              onClick={() => setTargetLang(code)}
+              className={`rounded-full border px-3 py-1 text-xs uppercase ${
+                targetLang === code ? "border-brand-500 text-white" : "border-slate-700 text-slate-400"
+              }`}
+            >
+              {code}
+            </button>
+          ))}
+          <label className="ml-2 flex items-center gap-1 text-xs text-slate-400">
+            <input
+              type="checkbox"
+              checked={dualView}
+              onChange={(e) => setDualView(e.target.checked)}
+            />
+            源/译对照
+          </label>
+        </div>
+      )}
+
+      <div className="mt-6">
+        <IngestPanel
+          sessionId={id}
+          token={token}
+          language={session?.sourceLanguage ?? ""}
+          targets={targets}
+        />
       </div>
     </div>
   );

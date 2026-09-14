@@ -137,3 +137,37 @@ def metrics():
         # 空 final 占比：接近 1 说明大量切片被判无语音（麦克风/降噪/VAD 问题）。
         "emptyRatio": round(empty / processed, 3) if processed else 0.0,
     }
+
+
+@app.get("/selftest")
+def vad_selftest():
+    """不依赖麦克风/队列，直接验证当前进程的 VAD 是否为新版。
+
+    用合成的低响度浊音（峰值约 0.005）与数字静音做判定：
+    旧进程（RMS 0.01 硬阈值）会把轻声判空，新进程应判为有语音。
+    部署后可直接 curl :8000/selftest 确认新代码已生效。
+    """
+    import numpy as np
+    from .audio import has_speech
+
+    sr = 16000
+    n = sr
+    rng = np.random.default_rng(0)
+    t = np.arange(n) / sr
+    phase = 2 * np.pi * np.cumsum(120 + 25 * np.sin(2 * np.pi * 1.3 * t)) / sr
+    voiced = np.sin(phase) * 0.7 + 0.2 * np.sin(2 * phase)
+    env = 0.4 + 0.6 * np.abs(np.sin(2 * np.pi * 2.0 * t))
+    mic = voiced * env + 0.03 * rng.standard_normal(n)
+    quiet = (mic / np.max(np.abs(mic)) * 0.005).astype(np.float32)  # 轻声
+    silence = np.zeros(n, dtype=np.float32)
+
+    quiet_voiced = bool(has_speech(quiet))
+    silence_silent = not bool(has_speech(silence))
+    ok = quiet_voiced and silence_silent
+    return {
+        "version": VERSION,
+        "quietSpeechDetected": quiet_voiced,
+        "silenceRejected": silence_silent,
+        "quietPeak": float(np.max(np.abs(quiet))),
+        "ok": ok,
+    }

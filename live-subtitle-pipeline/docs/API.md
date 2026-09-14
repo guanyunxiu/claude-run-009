@@ -42,7 +42,12 @@
 | POST | `/sessions` | 创建直播会话 |
 | GET | `/sessions?limit=50` | 最近会话列表 |
 | GET | `/sessions/:id` | 会话详情 |
-| POST | `/sessions/:id/end` | 结束会话（广播 `session-end`） |
+| POST | `/sessions/:id/end` | 结束会话（广播 `session-end`），host |
+| GET | `/sessions/:id/ingests` | 外部拉流任务状态，view+ |
+| POST | `/sessions/:id/ingests` | 启动 RTMP/HLS 拉流，host。body `{kind?:"rtmp"|"hls"|"webrtc", source, language?, targets?}`；webrtc 返回 400（预留） |
+| POST | `/sessions/:id/ingests/stop` | 停止拉流，host |
+
+拉流切片走与浏览器相同的 chunk→ASR 流水线（seq 使用 `SeqBase=1e9` 大基址，可与麦克风并存）；服务端用 ffmpeg 拉流，断流指数退避自动重连（默认最多 10 次）。
 
 `POST /sessions` 请求体（均有默认值）：
 
@@ -81,8 +86,11 @@ Content-Type: audio/pcm
 ### 字幕查询
 
 ```
-GET /sessions/:id/subtitles?limit=100&beforeSeq=50
+GET /sessions/:id/subtitles?limit=100&beforeSeq=50        # 最近 N 条（时间升序）
+GET /sessions/:id/subtitles?fromMs=...&toMs=...&limit=500 # 时间轴 scrub 窗口（升序）
 ```
+
+支持的查询参数：`limit`（≤500）、`beforeSeq`、`fromMs`/`toMs`（按 start/end ms 时间范围，用于历史回看）。返回项含 `source`（browser/rtmp/hls/…）与可选 `speaker`。
 
 只返回 **final** 字幕（partial 仅通过 WebSocket 实时推送，不落库）。
 

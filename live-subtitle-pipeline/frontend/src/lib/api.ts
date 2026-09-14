@@ -1,5 +1,6 @@
 import type {
   CreateSessionRequest,
+  IngestJob,
   PipelineStatus,
   ServerTime,
   SessionInfo,
@@ -84,6 +85,31 @@ export const api = {
     request<PipelineStatus>(
       `/api/v1/sessions/${id}/pipeline-status`,
       undefined,
+      opts,
+    ),
+
+  startIngest: (
+    id: string,
+    body: { kind?: string; source: string; language?: string; targets?: string[] },
+    opts?: CallOptions,
+  ) =>
+    request<IngestJob>(
+      `/api/v1/sessions/${id}/ingests`,
+      { method: "POST", body: JSON.stringify(body) },
+      opts,
+    ),
+
+  listIngests: (id: string, opts?: CallOptions) =>
+    request<{ jobs: IngestJob[] }>(
+      `/api/v1/sessions/${id}/ingests`,
+      undefined,
+      opts,
+    ),
+
+  stopIngest: (id: string, opts?: CallOptions) =>
+    request<{ status: string }>(
+      `/api/v1/sessions/${id}/ingests/stop`,
+      { method: "POST" },
       opts,
     ),
 

@@ -145,9 +145,11 @@ func (s *Server) buildRoutes() {
 func (s *Server) Router() *gin.Engine { return s.router }
 
 func (s *Server) handleHealth(ctx *gin.Context) {
-	resp := map[string]string{
-		"status":  "ok",
-		"version": version.String(),
+	resp := map[string]any{
+		"status":        "ok",
+		"version":       version.Version,
+		"migrations":    version.Migrations,
+		"ingestEnabled": s.ingests != nil,
 	}
 
 	if s.db != nil {
@@ -155,6 +157,12 @@ func (s *Server) handleHealth(ctx *gin.Context) {
 			resp["postgres"] = "down"
 		} else {
 			resp["postgres"] = "ok"
+			// 核对 ingest_jobs / 字幕增强列是否已随迁移落地（0003）。
+			var hasIngestTable bool
+			_ = s.db.QueryRowContext(ctx.Request.Context(),
+				`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='ingest_jobs')`,
+			).Scan(&hasIngestTable)
+			resp["ingestTable"] = hasIngestTable
 		}
 	}
 	if s.rdb != nil {
@@ -482,6 +490,26 @@ func (s *Server) handleUploadChunk(ctx *gin.Context) {
 	var targets []string
 	_ = json.Unmarshal(session.Targets, &targets)
 
+	// 先落元数据（幂等 ON CONFLICT），再入队：避免“入队成功但写库失败”后
+	// 客户端重试造成重复入队。若这里写库失败，返回 5xx 让客户端重试即可，
+	// 对象已上传、重试走最前面的幂等短路，不会产生重复任务。
+	dbResult, err := s.db.ExecContext(ctx.Request.Context(),
+		`INSERT INTO audio_chunks (session_id, seq, start_ms, end_ms, object_key, size_bytes, content_type, source)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'browser')
+		 ON CONFLICT (session_id, seq) DO NOTHING`,
+		sessionID, seq, startMs, endMs, objectKey, len(body), contentType)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if rows, _ := dbResult.RowsAffected(); rows == 0 {
+		// 并发/重试导致已存在：幂等成功，不再重复入队。
+		ctx.JSON(http.StatusOK, gin.H{
+			"sessionId": sessionID, "seq": seq, "deduped": true, "objectKey": objectKey,
+		})
+		return
+	}
+
 	task := model.ChunkTask{
 		TaskID:      uuid.NewString(),
 		SessionID:   sessionID,
@@ -498,17 +526,12 @@ func (s *Server) handleUploadChunk(ctx *gin.Context) {
 	}
 	messageID, err := s.tasks.Enqueue(ctx.Request.Context(), task)
 	if err != nil {
+		// 入队失败：标记该分片待补偿（删除元数据，使重试可重新入队），
+		// 避免“有分片记录却永不处理”。
+		_, _ = s.db.ExecContext(ctx.Request.Context(),
+			`DELETE FROM audio_chunks WHERE session_id=$1 AND seq=$2 AND object_key=$3`,
+			sessionID, seq, objectKey)
 		ctx.JSON(http.StatusBadGateway, gin.H{"error": "enqueue task: " + err.Error()})
-		return
-	}
-
-	_, err = s.db.ExecContext(ctx.Request.Context(),
-		`INSERT INTO audio_chunks (session_id, seq, start_ms, end_ms, object_key, size_bytes, content_type)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 ON CONFLICT (session_id, seq) DO NOTHING`,
-		sessionID, seq, startMs, endMs, objectKey, len(body), contentType)
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -525,8 +548,8 @@ func (s *Server) handleUploadChunk(ctx *gin.Context) {
 	})
 }
 
-// UploadIngestChunk 实现 ingest.ChunkUploader：外部拉流（RTMP/HLS/WebRTC）
-// 切好的 PCM 走与浏览器完全相同的“对象存储 -> Stream -> 元数据”路径。
+// UploadIngestChunk 实现 ingest.ChunkUploader：外部拉流（RTMP/HLS；webrtc 预留）
+// 切好的 PCM 走与浏览器完全相同的“对象存储 -> 元数据 -> Stream”路径。
 func (s *Server) UploadIngestChunk(ctx context.Context, sessionID string, seq, startMs, endMs int64, pcm []byte, source string) error {
 	if len(pcm) == 0 {
 		return nil
@@ -537,8 +560,7 @@ func (s *Server) UploadIngestChunk(ctx context.Context, sessionID string, seq, s
 		return fmt.Errorf("object storage: %w", err)
 	}
 
-	// 幂等：已存在同 seq 则跳过（注意拉流 seq 命名空间与浏览器可能重叠，
-	// 用 source 前缀的 objectKey + 唯一约束由 DB 保证；重复拉流重连时忽略）。
+	// 幂等：同 (session, seq, objectKey) 已存在则跳过（断流重连重投）。
 	var exists int
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT 1 FROM audio_chunks WHERE session_id=$1 AND seq=$2 AND object_key=$3`,
@@ -562,6 +584,19 @@ func (s *Server) UploadIngestChunk(ctx context.Context, sessionID string, seq, s
 	}
 	_ = json.Unmarshal(rawTargets, &targets)
 
+	// 先落元数据（幂等：前置 exists 查询 + 唯一约束兜底），再入队，避免重复入队。
+	dbResult, err := s.db.ExecContext(ctx,
+		`INSERT INTO audio_chunks (session_id, seq, start_ms, end_ms, object_key, size_bytes, content_type, source)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 ON CONFLICT (session_id, seq) DO NOTHING`,
+		sessionID, seq, startMs, endMs, objectKey, len(pcm), contentType, source)
+	if err != nil {
+		return err
+	}
+	if rows, _ := dbResult.RowsAffected(); rows == 0 {
+		return nil // 已存在，幂等
+	}
+
 	task := model.ChunkTask{
 		TaskID:      uuid.NewString(),
 		SessionID:   sessionID,
@@ -577,13 +612,11 @@ func (s *Server) UploadIngestChunk(ctx context.Context, sessionID string, seq, s
 		EnqueuedMs:  time.Now().UnixMilli(),
 	}
 	if _, err := s.tasks.Enqueue(ctx, task); err != nil {
+		// 入队失败：回滚元数据以便重连/重试可重新处理。
+		_, _ = s.db.ExecContext(ctx,
+			`DELETE FROM audio_chunks WHERE session_id=$1 AND seq=$2 AND object_key=$3`,
+			sessionID, seq, objectKey)
 		return fmt.Errorf("enqueue: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO audio_chunks (session_id, seq, start_ms, end_ms, object_key, size_bytes, content_type, source)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id, seq) DO NOTHING`,
-		sessionID, seq, startMs, endMs, objectKey, len(pcm), contentType, source); err != nil {
-		return err
 	}
 	return nil
 }
@@ -607,7 +640,14 @@ func (s *Server) handlePipelineStatus(ctx *gin.Context) {
 	_ = s.db.QueryRowContext(ctx.Request.Context(),
 		`SELECT max(created_at) FROM subtitles WHERE session_id=$1`, sessionID).Scan(&lastSubAt)
 
-	// 队列积压（Stream 长度，近似）。
+	// 真实消费积压 = 消费组待处理（pending，已投递未 ACK）数量。
+	// 不能用 XLEN：它是 Stream 历史总长度（默认 MAXLEN 未裁剪前一直增长），
+	// lag 已为 0 时仍可能很大，会误报“积压很高”。
+	var backlog int64
+	res, err := s.rdb.XPending(ctx.Request.Context(), s.cfg.StreamName, s.cfg.ConsumerGroup).Result()
+	if err == nil && res != nil {
+		backlog = res.Count
+	}
 	streamLen, _ := s.rdb.XLen(ctx.Request.Context(), s.cfg.StreamName).Result()
 
 	millis := func(t sql.NullTime) int64 {
@@ -621,8 +661,10 @@ func (s *Server) handlePipelineStatus(ctx *gin.Context) {
 		"chunks":         chunkCount,
 		"lastChunkMs":    millis(lastChunkAt),
 		"lastSubtitleMs": millis(lastSubAt),
-		"streamBacklog":  streamLen,
-		"serverMs":       time.Now().UnixMilli(),
+		// pending：已投递未 ACK 的真实积压；streamLen 仅作诊断参考。
+		"streamBacklog": backlog,
+		"streamLen":     streamLen,
+		"serverMs":      time.Now().UnixMilli(),
 	})
 }
 
@@ -633,15 +675,37 @@ func (s *Server) handleListSubtitles(ctx *gin.Context) {
 		limit = 100
 	}
 	beforeSeq, _ := strconv.ParseInt(ctx.Query("beforeSeq"), 10, 64)
+	fromMs, _ := strconv.ParseInt(ctx.Query("fromMs"), 10, 64)
+	toMs, _ := strconv.ParseInt(ctx.Query("toMs"), 10, 64)
 
-	query := `SELECT seq, start_ms, end_ms, language, text, translations, created_at
+	query := `SELECT seq, start_ms, end_ms, language, text, translations, source, speaker, created_at
 	          FROM subtitles WHERE session_id=$1`
 	args := []any{sessionID}
+	argN := 1
 	if beforeSeq > 0 {
-		query += " AND seq < $2"
+		argN++
+		query += fmt.Sprintf(" AND seq < $%d", argN)
 		args = append(args, beforeSeq)
 	}
-	query += fmt.Sprintf(" ORDER BY seq DESC LIMIT $%d", len(args)+1)
+	if fromMs > 0 {
+		argN++
+		query += fmt.Sprintf(" AND end_ms >= $%d", argN)
+		args = append(args, fromMs)
+	}
+	if toMs > 0 {
+		argN++
+		query += fmt.Sprintf(" AND start_ms <= $%d", argN)
+		args = append(args, toMs)
+	}
+	scrub := fromMs > 0 || toMs > 0
+	argN++
+	if scrub {
+		// 时间轴 scrub：按时间升序返回窗口内字幕。
+		query += fmt.Sprintf(" ORDER BY start_ms ASC, seq ASC LIMIT $%d", argN)
+	} else {
+		// 默认：最近 N 条（倒序取，随后翻正）。
+		query += fmt.Sprintf(" ORDER BY start_ms DESC, seq DESC LIMIT $%d", argN)
+	}
 	args = append(args, limit)
 
 	rows, err := s.db.QueryContext(ctx.Request.Context(), query, args...)
@@ -654,23 +718,31 @@ func (s *Server) handleListSubtitles(ctx *gin.Context) {
 	subtitles := make([]gin.H, 0, limit)
 	for rows.Next() {
 		var seq, startMs, endMs int64
-		var language, text string
+		var language, text, source, speaker string
 		var translations []byte
 		var createdAt time.Time
-		if err := rows.Scan(&seq, &startMs, &endMs, &language, &text, &translations, &createdAt); err != nil {
+		if err := rows.Scan(&seq, &startMs, &endMs, &language, &text, &translations,
+			&source, &speaker, &createdAt); err != nil {
 			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		subtitles = append(subtitles, gin.H{
+		item := gin.H{
 			"seq": seq, "startMs": startMs, "endMs": endMs,
 			"isFinal": true, "language": language, "text": text,
 			"translations": json.RawMessage(translations),
+			"source":       source,
 			"createdAt":    createdAt.UTC().Format(time.RFC3339Nano),
-		})
+		}
+		if speaker != "" {
+			item["speaker"] = speaker
+		}
+		subtitles = append(subtitles, item)
 	}
-	// 逆序查出后翻正为 seq 升序。
-	for i, j := 0, len(subtitles)-1; i < j; i, j = i+1, j-1 {
-		subtitles[i], subtitles[j] = subtitles[j], subtitles[i]
+	// 默认查询为倒序取最近 N 条，翻正为时间升序；scrub 窗口本就升序。
+	if !scrub {
+		for i, j := 0, len(subtitles)-1; i < j; i, j = i+1, j-1 {
+			subtitles[i], subtitles[j] = subtitles[j], subtitles[i]
+		}
 	}
 	ctx.JSON(http.StatusOK, gin.H{"sessionId": sessionID, "subtitles": subtitles})
 }

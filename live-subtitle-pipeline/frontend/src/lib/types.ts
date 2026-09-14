@@ -65,5 +65,21 @@ export interface PipelineStatus {
   lastChunkMs: number;
   lastSubtitleMs: number;
   streamBacklog: number;
+  streamLen?: number;
   serverMs: number;
+}
+
+export interface IngestJob {
+  id: string;
+  sessionId: string;
+  kind: "rtmp" | "hls" | "webrtc";
+  sourceUrl: string;
+  language: string;
+  targets: string[];
+  status: "starting" | "running" | "reconnecting" | "stopped" | "failed";
+  pid?: number;
+  error?: string;
+  chunks: number;
+  startedAt: number;
+  updatedAt: number;
 }

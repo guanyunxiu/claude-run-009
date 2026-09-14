@@ -54,6 +54,11 @@ func (p *FFmpegPuller) Args() []string {
 }
 
 func (p *FFmpegPuller) Start(ctx context.Context) (io.ReadCloser, error) {
+	// WebRTC/WHEP 需要 RTP/Opus 解复用（SFU/WHEP server），ffmpeg 无法直接拉
+	// 浏览器的 WebRTC 会话。这里快速、明确地失败，避免用 ffmpeg 误拉 ws/whep URL。
+	if p.kind == KindWebRTC {
+		return nil, ErrWebRTCNotSupported
+	}
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return nil, fmt.Errorf("ffmpeg not found in PATH: %w", err)
 	}

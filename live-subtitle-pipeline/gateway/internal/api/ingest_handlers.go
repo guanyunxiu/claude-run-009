@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,12 @@ func (s *Server) handleCreateIngest(ctx *gin.Context) {
 	kind, err := ingest.NormalizeKind(req.Kind, req.Source)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// WebRTC/WHEP 服务端收流本轮未实现（数据模型已预留）：明确返回 400，
+	// 不静默走 ffmpeg 去拉 ws。
+	if kind == ingest.KindWebRTC {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": ingest.ErrWebRTCNotSupported.Error()})
 		return
 	}
 
@@ -84,11 +91,16 @@ func (s *Server) Persist(ctx context.Context, job *ingest.Job) error {
 	if s.db == nil {
 		return nil
 	}
+	// targets 是 JSONB，必须序列化为 JSON 文本，不能把 []string 直接交给驱动。
+	targetsJSON, err := json.Marshal(job.Targets)
+	if err != nil {
+		return err
+	}
 	var pid any
 	if job.PID > 0 {
 		pid = job.PID
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO ingest_jobs (id, session_id, kind, source_url, language, targets, status, pid, error, chunks, started_at, updated_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
 		         to_timestamp($11/1000.0), to_timestamp($12/1000.0))
@@ -99,7 +111,7 @@ func (s *Server) Persist(ctx context.Context, job *ingest.Job) error {
 		                   THEN COALESCE(ingest_jobs.stopped_at, now())
 		                   ELSE ingest_jobs.stopped_at END`,
 		job.ID, job.SessionID, string(job.Kind), job.SourceURL, job.Language,
-		job.Targets, string(job.Status), pid, job.Error, job.Chunks,
+		targetsJSON, string(job.Status), pid, job.Error, job.Chunks,
 		job.StartedAt, job.UpdatedAt)
 	return err
 }

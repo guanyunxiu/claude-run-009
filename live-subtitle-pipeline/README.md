@@ -167,12 +167,14 @@ live-subtitle-pipeline/
 0. **先确认 worker 进程加载的是新代码**。本机裸跑的 uvicorn 不会自动加载磁盘改动，
    必须重启；用版本字段核对（旧进程没有 `version`，旧 VAD 仍会把轻声判空）：
    ```bash
-   curl -s localhost:8000/health          # 新进程含 "version":"2026.09.14-vad"
+   curl -s localhost:8000/health          # 新进程含 "version":"2026.09.14-vad2"
    curl -s localhost:8000/metrics         # 含 emptyRatio
-   # 本机裸跑：重启进程
-   #   在 worker/ 目录重新执行 uvicorn app.main:app --host 0.0.0.0 --port 8000
-   # Docker：docker compose restart asr-worker   （或下方强制重建）
+   curl -s localhost:8000/selftest        # ok:true, quietSpeechDetected:true
+   # /selftest 用合成轻声直接验证当前进程的 VAD，不依赖麦克风/队列。
+   # 本机裸跑：在 worker/ 目录重启 uvicorn app.main:app --host 0.0.0.0 --port 8000
+   # Docker：见一键重建脚本 deploy-rebuild.sh
    ```
+   一键无缓存重建并自检：`./deploy-rebuild.sh`
 1. 确认容器里跑的是新网关包（旧包没有探针路由）：
    ```bash
    curl -s localhost:8080/api/v1/health            # 新包返回含 "version"

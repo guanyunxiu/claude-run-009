@@ -14,6 +14,7 @@ export default function WatchPage() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [error, setError] = useState("");
   const [targetLang, setTargetLang] = useState<string>("");
+  const [dualView, setDualView] = useState(false);
 
   // 观众令牌：来自主播分享链接 ?token=<viewToken>，或本机已保存的令牌。
   const token = useMemo(
@@ -82,6 +83,7 @@ export default function WatchPage() {
               partial={subtitles.currentPartial}
               lastFinal={lastFinal}
               targetLang={targetLang || undefined}
+              dual={dualView}
             />
           </div>
 
@@ -101,6 +103,14 @@ export default function WatchPage() {
                 ))}
               </select>
             </div>
+            <label className="flex items-center gap-1 text-xs text-slate-400">
+              <input
+                type="checkbox"
+                checked={dualView}
+                onChange={(e) => setDualView(e.target.checked)}
+              />
+              源/译对照
+            </label>
             <div className="ml-auto">
               <LatencyMeter latency={subtitles.lastLatency} />
             </div>

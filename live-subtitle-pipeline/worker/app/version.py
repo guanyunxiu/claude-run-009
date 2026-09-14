@@ -5,5 +5,5 @@
 """
 
 # 静态版本号：每次发布 worker 能力变更时递增。
-# 2026.09.14-vad：自适应 VAD，修复低响度说话空转写。
-VERSION = "2026.09.14-vad"
+# 2026.09.14-vad2：自适应 VAD + /selftest 自检 + emptyRatio。
+VERSION = "2026.09.14-vad2"

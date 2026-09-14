@@ -141,6 +141,12 @@ func (m *Manager) Get(sessionID string) *Job {
 func (m *Manager) run(ctx context.Context, mj *managedJob) {
 	defer close(mj.done)
 
+	// 不支持的来源（如尚未实现的 WebRTC/WHEP）立即失败，不进入重连循环。
+	if mj.job.Kind == KindWebRTC {
+		m.setStatus(mj, StatusFailed, ErrWebRTCNotSupported.Error())
+		return
+	}
+
 	backoff := m.config.RestartBackoff
 	for attempt := 0; attempt <= m.config.MaxRestarts; attempt++ {
 		if ctx.Err() != nil {

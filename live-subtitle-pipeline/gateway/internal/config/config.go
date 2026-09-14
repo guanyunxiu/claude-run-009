@@ -15,6 +15,7 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 	StreamName    string
+	ConsumerGroup string
 	PubSubPrefix  string
 
 	MinIOEndpoint  string
@@ -66,6 +67,7 @@ func Load() Config {
 		RedisPassword: os.Getenv("REDIS_PASSWORD"),
 		RedisDB:       getenvInt("REDIS_DB", 0),
 		StreamName:    getenv("REDIS_STREAM", "asr:tasks"),
+		ConsumerGroup: getenv("REDIS_GROUP", "asr-workers"),
 		PubSubPrefix:  getenv("PUBSUB_PREFIX", "subtitles"),
 
 		MinIOEndpoint:  getenv("MINIO_ENDPOINT", "localhost:9000"),

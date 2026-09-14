@@ -68,6 +68,9 @@ var (
 	ErrJobNotFound      = errors.New("ingest job not found")
 	ErrJobAlreadyActive = errors.New("an active ingest job already exists for this session")
 	ErrUnsupportedKind  = errors.New("unsupported ingest source kind")
+	// ErrWebRTCNotSupported：本轮未实现服务端 WebRTC/WHEP 收流，
+	// 数据模型/契约（kind=webrtc）已预留，接入需 SFU/WHEP + Opus 解码。
+	ErrWebRTCNotSupported = errors.New("webrtc ingest requires a WHEP/SFU receiver and is not implemented; use rtmp/hls")
 )
 
 // SeqBase 拉流分片 seq 大基址：浏览器采集从 0 起，拉流从此基址起，
