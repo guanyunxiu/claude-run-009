@@ -16,7 +16,7 @@ func TestSplitPCMChunksAndTiming(t *testing.T) {
 	stream := bytes.NewReader(make([]byte, total))
 
 	var got []Chunk
-	next, err := SplitPCM(stream, 9000, 5, func(c Chunk) error {
+	n, err := SplitPCM(stream, 9000, func(_ int64, c Chunk) error {
 		got = append(got, c)
 		return nil
 	})
@@ -26,12 +26,15 @@ func TestSplitPCMChunksAndTiming(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("chunks=%d want 3", len(got))
 	}
-	if next != 8 {
-		t.Fatalf("next seq=%d want 8", next)
+	if n != 3 {
+		t.Fatalf("count=%d want 3", n)
 	}
-	// seq 从 5 起，anchor=9000；首片 start = 9000 + 5*3000 = 24000。
-	if got[0].Seq != 5 || got[0].StartMs != 24000 || got[0].EndMs != 27000 {
+	// 本段相对序号从 0 起；anchor=9000，首片 start=9000、end=12000。
+	if got[0].Seq != 0 || got[0].StartMs != 9000 || got[0].EndMs != 12000 {
 		t.Fatalf("first chunk timing wrong: %+v", got[0])
+	}
+	if got[1].Seq != 1 {
+		t.Fatalf("second local seq=%d want 1", got[1].Seq)
 	}
 	if len(got[1].PCM) != ChunkBytes {
 		t.Fatalf("second chunk bytes=%d", len(got[1].PCM))
@@ -47,7 +50,7 @@ func TestSplitPCMChunksAndTiming(t *testing.T) {
 func TestSplitPCMPropagatesCallbackError(t *testing.T) {
 	stream := bytes.NewReader(make([]byte, ChunkBytes*2))
 	stopErr := errors.New("session ended")
-	_, err := SplitPCM(stream, 0, 0, func(Chunk) error { return stopErr })
+	_, err := SplitPCM(stream, 0, func(int64, Chunk) error { return stopErr })
 	if !errors.Is(err, stopErr) {
 		t.Fatalf("err=%v want stopErr", err)
 	}
@@ -141,6 +144,14 @@ func TestManagerStartsStreamsAndStops(t *testing.T) {
 	if up.source != "rtmp" {
 		t.Fatalf("source tag=%q want rtmp", up.source)
 	}
+	// 全局 seq = SeqBase + 本段相对序号，且时间戳从本段锚点起、单调。
+	if up.chunks[0].Seq != SeqBase+0 || up.chunks[1].Seq != SeqBase+1 {
+		t.Fatalf("global seq = %d,%d want %d,%d",
+			up.chunks[0].Seq, up.chunks[1].Seq, SeqBase, SeqBase+1)
+	}
+	if up.chunks[1].StartMs < up.chunks[0].StartMs || up.chunks[0].StartMs < 0 {
+		t.Fatalf("timestamps not monotonic from anchor: %+v", up.chunks)
+	}
 	up.mu.Unlock()
 
 	// EOF 后 MaxRestarts=0 会进入 failed/stopped；主动 Stop 应幂等可调用。
@@ -190,4 +201,30 @@ func TestManagerRejectsSecondActiveJob(t *testing.T) {
 		t.Fatalf("second start err=%v want ErrJobAlreadyActive", err)
 	}
 	_ = m.Stop(context.Background(), "s3")
+}
+
+// 直接验证 SplitPCM 时间轴：任意调用（模拟重连）都以当前 anchorMs 起、
+// 本段相对序号计，绝不因历史累计片数而漂到未来。
+func TestReconnectTimelineResetsToWallClock(t *testing.T) {
+	// 第二次连接：假设之前已累计 1000 片。
+	anchorMs := int64(1_000_000)
+	stream := bytes.NewReader(make([]byte, ChunkBytes*2))
+	var times []int64
+	n, err := SplitPCM(stream, anchorMs, func(localSeq int64, c Chunk) error {
+		times = append(times, c.StartMs)
+		if localSeq >= 2 {
+			t.Fatalf("localSeq should restart at 0 per connection, got %d", localSeq)
+		}
+		return nil
+	})
+	if err != nil || n != 2 {
+		t.Fatalf("split n=%d err=%v", n, err)
+	}
+	// 首片精确等于本段锚点；第二片 +3s。绝不能是 anchor + 1000*3000。
+	if times[0] != anchorMs {
+		t.Fatalf("first start=%d want anchor %d (no cumulative drift)", times[0], anchorMs)
+	}
+	if times[1] != anchorMs+3000 {
+		t.Fatalf("second start=%d want %d", times[1], anchorMs+3000)
+	}
 }

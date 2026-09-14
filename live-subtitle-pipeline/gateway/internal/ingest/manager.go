@@ -193,14 +193,20 @@ func (m *Manager) runOnce(ctx context.Context, mj *managedJob) error {
 	mj.mu.Unlock()
 	_ = m.store.Persist(ctx, snapshot(mj))
 
+	// 每次连接都用“当前墙钟”作为本段锚点；时间戳按本段相对序号计算，
+	// 全局 seq 另加 Chunks 基数，避免重连后时间跳到未来。
 	anchorMs := nowMs()
-	_, splitErr := SplitPCM(stdout, anchorMs, snapshot(mj).Chunks, func(c Chunk) error {
-		globalSeq := SeqBase + c.Seq // 与浏览器 seq 命名空间隔离
+	mj.mu.RLock()
+	baseChunks := mj.job.Chunks
+	mj.mu.RUnlock()
+
+	_, splitErr := SplitPCM(stdout, anchorMs, func(localSeq int64, c Chunk) error {
+		globalSeq := SeqBase + baseChunks + localSeq // 与浏览器 seq 命名空间隔离
 		if err := m.uploader.UploadIngestChunk(ctx, mj.job.SessionID, globalSeq, c.StartMs, c.EndMs, c.PCM, string(mj.job.Kind)); err != nil {
 			return err
 		}
 		mj.mu.Lock()
-		mj.job.Chunks = c.Seq + 1
+		mj.job.Chunks = baseChunks + localSeq + 1
 		mj.job.UpdatedAt = nowMs()
 		mj.mu.Unlock()
 		_ = m.store.Persist(context.Background(), snapshot(mj))

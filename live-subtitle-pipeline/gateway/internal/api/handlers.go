@@ -188,6 +188,23 @@ func (s *Server) handleServerTime(ctx *gin.Context) {
 	})
 }
 
+// streamBacklog 返回队列积压：pending（已投递未 ACK）与 lag（已入 stream 但
+// 消费组尚未读取，来自 Redis 7 的 XINFO GROUPS）。lag 未知时 lagKnown=false，
+// 调用方只用 pending。关键场景：消费组无人读时 lag 增长而 pending 可能为 0。
+func streamBacklog(ctx context.Context, rdb *redis.Client, stream, group string) (pending, lag int64, lagKnown bool) {
+	if res, err := rdb.XPending(ctx, stream, group).Result(); err == nil && res != nil {
+		pending = res.Count
+	}
+	if groups, err := rdb.XInfoGroups(ctx, stream).Result(); err == nil {
+		for _, g := range groups {
+			if g.Name == group {
+				return pending, g.Lag, true
+			}
+		}
+	}
+	return pending, 0, false
+}
+
 type createSessionRequest struct {
 	SourceLanguage  string   `json:"sourceLanguage"`
 	TargetLanguages []string `json:"targetLanguages"`
@@ -640,13 +657,14 @@ func (s *Server) handlePipelineStatus(ctx *gin.Context) {
 	_ = s.db.QueryRowContext(ctx.Request.Context(),
 		`SELECT max(created_at) FROM subtitles WHERE session_id=$1`, sessionID).Scan(&lastSubAt)
 
-	// 真实消费积压 = 消费组待处理（pending，已投递未 ACK）数量。
-	// 不能用 XLEN：它是 Stream 历史总长度（默认 MAXLEN 未裁剪前一直增长），
-	// lag 已为 0 时仍可能很大，会误报“积压很高”。
-	var backlog int64
-	res, err := s.rdb.XPending(ctx.Request.Context(), s.cfg.StreamName, s.cfg.ConsumerGroup).Result()
-	if err == nil && res != nil {
-		backlog = res.Count
+	// 真实积压 = pending + lag：
+	//   pending：已投递给消费组但未 XACK（处理中/失败）；
+	//   lag：已 XADD 进 stream 但消费组还没读到（worker 没在消费/没人读），
+	//        来自 XINFO GROUPS（Redis 7）。仅看 pending 会在“无人读”时误报为 0。
+	pending, lag, lagKnown := streamBacklog(ctx.Request.Context(), s.rdb, s.cfg.StreamName, s.cfg.ConsumerGroup)
+	backlog := pending
+	if lagKnown {
+		backlog += lag
 	}
 	streamLen, _ := s.rdb.XLen(ctx.Request.Context(), s.cfg.StreamName).Result()
 
@@ -661,8 +679,11 @@ func (s *Server) handlePipelineStatus(ctx *gin.Context) {
 		"chunks":         chunkCount,
 		"lastChunkMs":    millis(lastChunkAt),
 		"lastSubtitleMs": millis(lastSubAt),
-		// pending：已投递未 ACK 的真实积压；streamLen 仅作诊断参考。
+		// 有效积压 = 未 ACK(pending) + 消费组尚未读取(lag)。
 		"streamBacklog": backlog,
+		"pending":       pending,
+		"lag":           lag,
+		"lagKnown":      lagKnown,
 		"streamLen":     streamLen,
 		"serverMs":      time.Now().UnixMilli(),
 	})

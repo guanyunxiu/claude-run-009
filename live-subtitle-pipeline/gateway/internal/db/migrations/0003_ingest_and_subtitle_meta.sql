@@ -11,12 +11,14 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
     pid           INTEGER,                          -- 拉流子进程 PID（运行态回填）
     error         TEXT NOT NULL DEFAULT '',
     chunks        BIGINT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     stopped_at    TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_ingest_jobs_session ON ingest_jobs (session_id, created_at DESC);
+-- 列表按 started_at 倒序取最近任务（ingest_jobs 的创建/开始时间列）。
+CREATE INDEX IF NOT EXISTS idx_ingest_jobs_session ON ingest_jobs (session_id, started_at DESC);
 -- 同一会话同一时刻只允许一个非终态（starting/running/reconnecting）任务。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_jobs_one_active
     ON ingest_jobs (session_id)

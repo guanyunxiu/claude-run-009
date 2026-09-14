@@ -17,44 +17,42 @@ const (
 
 // SplitPCM 把连续 S16LE 字节流切成定长 Chunk。
 //
-// 这是纯函数（不依赖 ffmpeg），seq 从给定初值递增，时间戳基于 anchorMs：
-//   - 常规片长度恰为 ChunkBytes；
-//   - 流结束时不足一片的尾巴作为最后一片（仍上传）。
+// 这是纯函数（不依赖 ffmpeg）。每一段（一次 ffmpeg 连接）的时间戳都从
+// anchorMs 起、按“本段内相对序号 0,1,2…”递增；调用方在回调中自行加上全局
+// seq 基数。这样断流重连后 anchorMs 重置为当前墙钟，时间轴不会因累计 seq
+// 而跳到未来。
 //
-// 回调 onChunk 返回错误则中止（例如会话已结束）。
-func SplitPCM(r io.Reader, anchorMs int64, seqStart int64, onChunk func(Chunk) error) (int64, error) {
+// 返回本段切出的片数。回调 onChunk 返回错误则中止。
+func SplitPCM(r io.Reader, anchorMs int64, onChunk func(localSeq int64, c Chunk) error) (int64, error) {
 	buf := make([]byte, ChunkBytes)
-	seq := seqStart
+	var localSeq int64
 
 	for {
 		// readFull 读到 EOF 时若有残留会返回 io.ErrUnexpectedEOF。
 		n, err := io.ReadFull(r, buf)
 		if n > 0 {
-			chunk := makeChunk(buf[:n], anchorMs, seq)
-			if cbErr := onChunk(chunk); cbErr != nil {
-				return seq, cbErr
+			chunk := makeChunk(buf[:n], anchorMs, localSeq)
+			if cbErr := onChunk(localSeq, chunk); cbErr != nil {
+				return localSeq, cbErr
 			}
-			seq++
+			localSeq++
 		}
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			// ErrUnexpectedEOF 的残留已在上面处理；纯 EOF 时 n==0。
-			if n == 0 {
-				return seq, nil
-			}
-			return seq, nil
+			return localSeq, nil
 		}
 		if err != nil {
-			return seq, err
+			return localSeq, err
 		}
 	}
 }
 
-func makeChunk(pcm []byte, anchorMs, seq int64) Chunk {
-	startMs := anchorMs + seq*ChunkSeconds*1000
+func makeChunk(pcm []byte, anchorMs, localSeq int64) Chunk {
+	startMs := anchorMs + localSeq*ChunkSeconds*1000
 	// 先乘后除，避免 1.5s 这类时长被整数整除截断。
 	durationMs := int64(len(pcm)) * 1000 / (SampleRate * Channels * BytesSample)
 	return Chunk{
-		Seq:     seq,
+		// Seq 字段此处填本段相对序号；全局 seq 由调用方（Manager）加基数。
+		Seq:     localSeq,
 		StartMs: startMs,
 		EndMs:   startMs + durationMs,
 		PCM:     append([]byte(nil), pcm...),

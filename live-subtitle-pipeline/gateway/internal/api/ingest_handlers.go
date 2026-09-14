@@ -127,13 +127,17 @@ func (s *Server) handleListIngests(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, gin.H{"jobs": []*ingest.Job{job}})
 		return
 	}
-	// 回退：查库中的历史任务。
+	// 回退：查库中的历史/非本实例任务。
 	rows, err := s.db.QueryContext(ctx.Request.Context(),
 		`SELECT id, kind, source_url, language, status, COALESCE(pid,0), error, COALESCE(chunks,0),
 		        EXTRACT(EPOCH FROM started_at)*1000, EXTRACT(EPOCH FROM updated_at)*1000
-		 FROM ingest_jobs WHERE session_id=$1 ORDER BY created_at DESC LIMIT 20`, sessionID)
+		 FROM ingest_jobs WHERE session_id=$1 ORDER BY started_at DESC LIMIT 20`, sessionID)
 	if err != nil {
-		ctx.JSON(http.StatusOK, gin.H{"jobs": []any{}})
+		// 不再静默吞错返回空：明确告知（通常是迁移未应用/旧库无该表）。
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error": "query ingest jobs failed (migration 0003 applied?): " + err.Error(),
+			"jobs":  []any{},
+		})
 		return
 	}
 	defer rows.Close()
@@ -142,15 +146,21 @@ func (s *Server) handleListIngests(ctx *gin.Context) {
 		j := &ingest.Job{}
 		var kind, lang, st, src, errMsg string
 		if err := rows.Scan(&j.ID, &kind, &src, &lang, &st, &j.PID, &errMsg, &j.Chunks,
-			&j.StartedAt, &j.UpdatedAt); err == nil {
-			j.SessionID = sessionID
-			j.Kind = ingest.SourceKind(kind)
-			j.SourceURL = src
-			j.Language = lang
-			j.Status = ingest.JobStatus(st)
-			j.Error = errMsg
-			jobs = append(jobs, j)
+			&j.StartedAt, &j.UpdatedAt); err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
 		}
+		j.SessionID = sessionID
+		j.Kind = ingest.SourceKind(kind)
+		j.SourceURL = src
+		j.Language = lang
+		j.Status = ingest.JobStatus(st)
+		j.Error = errMsg
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	ctx.JSON(http.StatusOK, gin.H{"jobs": jobs})
 }

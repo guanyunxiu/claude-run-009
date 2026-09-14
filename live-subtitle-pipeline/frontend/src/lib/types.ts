@@ -65,6 +65,9 @@ export interface PipelineStatus {
   lastChunkMs: number;
   lastSubtitleMs: number;
   streamBacklog: number;
+  pending?: number;
+  lag?: number;
+  lagKnown?: boolean;
   streamLen?: number;
   serverMs: number;
 }

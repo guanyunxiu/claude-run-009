@@ -12,7 +12,7 @@ var (
 )
 
 // Version 静态能力标识（随源码提交）。每次新增网关能力（路由/迁移）时递增。
-const Version = "2026.09.14-ingest"
+const Version = "2026.09.14-ingest2"
 
 // Migrations 当前二进制期望应用的迁移文件数（用于 /health 自证 0003 已随新包生效）。
 const Migrations = 3
