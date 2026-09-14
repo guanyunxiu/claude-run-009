@@ -19,6 +19,7 @@ import (
 
 	"github.com/livesub/gateway/internal/auth"
 	"github.com/livesub/gateway/internal/config"
+	"github.com/livesub/gateway/internal/ingest"
 	"github.com/livesub/gateway/internal/model"
 	"github.com/livesub/gateway/internal/queue"
 	"github.com/livesub/gateway/internal/storage"
@@ -27,13 +28,14 @@ import (
 )
 
 type Server struct {
-	cfg    config.Config
-	db     *sql.DB
-	store  *storage.ObjectStore
-	tasks  *queue.TaskQueue
-	rdb    *redis.Client
-	hub    *ws.Hub
-	router *gin.Engine
+	cfg     config.Config
+	db      *sql.DB
+	store   *storage.ObjectStore
+	tasks   *queue.TaskQueue
+	rdb     *redis.Client
+	hub     *ws.Hub
+	ingests *ingest.Manager
+	router  *gin.Engine
 
 	// tokenLookupOverride 仅供测试注入鉴权身份（避免依赖真实 PostgreSQL）。
 	tokenLookupOverride auth.TokenLookup
@@ -72,6 +74,11 @@ func (s *Server) requireHub() *ws.Hub {
 	return s.hub
 }
 
+// SetIngestManager 注入外部拉流管理器（main 在对象存储就绪后创建）。
+func (s *Server) SetIngestManager(m *ingest.Manager) {
+	s.ingests = m
+}
+
 func (s *Server) buildRoutes() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
@@ -108,6 +115,8 @@ func (s *Server) buildRoutes() {
 		{
 			sess.GET("", s.handleGetSession)
 			sess.GET("/subtitles", s.handleListSubtitles)
+			// 外部拉流任务状态（host/view 均可看）。
+			sess.GET("/ingests", s.handleListIngests)
 			// 流水线探针：最近分片/字幕时间与队列积压，供前端在“无字幕”时提示原因。
 			sess.GET("/pipeline-status", s.handlePipelineStatus)
 			// WebSocket：浏览器无法设置请求头，允许 query token（仅读）。
@@ -124,6 +133,9 @@ func (s *Server) buildRoutes() {
 		{
 			host.POST("/end", s.handleEndSession)
 			host.POST("/chunks", s.handleUploadChunk)
+			// 外部直播源（RTMP/HLS）拉流任务：启动/停止（host 专属）。
+			host.POST("/ingests", s.handleCreateIngest)
+			host.POST("/ingests/stop", s.handleStopIngest)
 		}
 	}
 
@@ -508,8 +520,72 @@ func (s *Server) handleUploadChunk(ctx *gin.Context) {
 		"objectKey": objectKey,
 		"bytes":     len(body),
 		"streamId":  messageID,
+		"source":    "browser",
 		"status":    "queued",
 	})
+}
+
+// UploadIngestChunk 实现 ingest.ChunkUploader：外部拉流（RTMP/HLS/WebRTC）
+// 切好的 PCM 走与浏览器完全相同的“对象存储 -> Stream -> 元数据”路径。
+func (s *Server) UploadIngestChunk(ctx context.Context, sessionID string, seq, startMs, endMs int64, pcm []byte, source string) error {
+	if len(pcm) == 0 {
+		return nil
+	}
+	contentType := "audio/pcm"
+	objectKey := fmt.Sprintf("%s/%s-%012d.pcm", sessionID, source, seq)
+	if err := s.store.Put(ctx, objectKey, contentType, bytes.NewReader(pcm), int64(len(pcm))); err != nil {
+		return fmt.Errorf("object storage: %w", err)
+	}
+
+	// 幂等：已存在同 seq 则跳过（注意拉流 seq 命名空间与浏览器可能重叠，
+	// 用 source 前缀的 objectKey + 唯一约束由 DB 保证；重复拉流重连时忽略）。
+	var exists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM audio_chunks WHERE session_id=$1 AND seq=$2 AND object_key=$3`,
+		sessionID, seq, objectKey).Scan(&exists); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	var targets []string
+	var language string
+	var rawTargets []byte
+	qerr := s.db.QueryRowContext(ctx,
+		`SELECT source_language, target_languages FROM sessions WHERE id=$1 AND status='active'`,
+		sessionID).Scan(&language, &rawTargets)
+	if errors.Is(qerr, sql.ErrNoRows) {
+		return fmt.Errorf("session %s not active", sessionID)
+	}
+	if qerr != nil {
+		return qerr
+	}
+	_ = json.Unmarshal(rawTargets, &targets)
+
+	task := model.ChunkTask{
+		TaskID:      uuid.NewString(),
+		SessionID:   sessionID,
+		Seq:         seq,
+		StartMs:     startMs,
+		EndMs:       endMs,
+		ObjectKey:   objectKey,
+		ContentType: contentType,
+		SampleRate:  16000,
+		Channels:    1,
+		Language:    language,
+		Targets:     targets,
+		EnqueuedMs:  time.Now().UnixMilli(),
+	}
+	if _, err := s.tasks.Enqueue(ctx, task); err != nil {
+		return fmt.Errorf("enqueue: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO audio_chunks (session_id, seq, start_ms, end_ms, object_key, size_bytes, content_type, source)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id, seq) DO NOTHING`,
+		sessionID, seq, startMs, endMs, objectKey, len(pcm), contentType, source); err != nil {
+		return err
+	}
+	return nil
 }
 
 // handlePipelineStatus 返回会话流水线探针：

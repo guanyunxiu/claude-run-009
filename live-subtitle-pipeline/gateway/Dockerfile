@@ -20,7 +20,8 @@ RUN go build -ldflags="-s -w" -o /out/gateway ./cmd/server
 # ---- runtime stage ----
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+# ffmpeg 用于 RTMP/HLS 拉流（ingest 子系统）；wget 供健康检查。
+RUN apk add --no-cache ca-certificates tzdata ffmpeg wget
 WORKDIR /app
 COPY --from=builder /out/gateway /app/gateway
 

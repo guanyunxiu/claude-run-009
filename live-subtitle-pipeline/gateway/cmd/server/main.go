@@ -14,6 +14,7 @@ import (
 	"github.com/livesub/gateway/internal/api"
 	"github.com/livesub/gateway/internal/config"
 	"github.com/livesub/gateway/internal/db"
+	"github.com/livesub/gateway/internal/ingest"
 	"github.com/livesub/gateway/internal/storage"
 	"github.com/livesub/gateway/internal/ws"
 )
@@ -64,6 +65,12 @@ func main() {
 	server := api.NewServer(cfg, database, rdb, store, nil)
 	hub := ws.NewHub(rdb, cfg.PubSubPrefix, cfg.WSAllowedOrigins, server)
 	server.SetHub(hub)
+
+	// 外部直播源拉流（RTMP/HLS）：Server 同时是 ChunkUploader 与 Store，
+	// 切出的 PCM 进入与浏览器相同的 ASR 流水线。ffmpeg 缺失时拉流会在任务级报错。
+	ingestMgr := ingest.NewManager(server, server)
+	server.SetIngestManager(ingestMgr)
+
 	go hub.RunPubSub(rootCtx)
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
