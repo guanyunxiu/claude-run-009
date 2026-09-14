@@ -63,3 +63,18 @@ def test_subtitle_serializes_camel_case():
     assert body["translations"] == {"en": "Hello"}
     # 不应泄漏 snake_case 字段
     assert not any("_" in key for key in body)
+
+
+def test_version_exposed():
+    """新进程必须暴露 version（用于确认容器/进程加载了新代码，而非旧进程）。"""
+    from app.version import VERSION
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    # 不触发 lifespan（避免依赖 redis/pg/minio），直接请求路由。
+    client = TestClient(app)
+    health = client.get("/health").json()
+    metrics = client.get("/metrics").json()
+    assert health.get("version") == VERSION
+    assert metrics.get("version") == VERSION
+    assert "emptyRatio" in metrics

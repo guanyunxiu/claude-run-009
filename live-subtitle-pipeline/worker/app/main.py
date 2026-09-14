@@ -15,6 +15,7 @@ from .config import get_settings
 from .consumer import Consumer
 from .services import Database, EventBus, ObjectStorage
 from .translate import build_translator
+from .version import VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,8 +67,9 @@ def _connect_storage_with_retry(timeout: float = 40.0) -> ObjectStorage:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("worker %s booting (asr=%s, translate=%s)",
-                settings.worker_id, settings.asr_provider, settings.translate_provider)
+    logger.info("worker %s booting version=%s (asr=%s, translate=%s)",
+                settings.worker_id, VERSION, settings.asr_provider,
+                settings.translate_provider)
 
     rdb = redis.Redis(
         host=settings.redis_addr.split(":")[0],
@@ -104,7 +106,7 @@ app = FastAPI(title="Live Subtitle ASR Worker", version="1.0.0", lifespan=lifesp
 @app.get("/health")
 def health():
     rdb: redis.Redis | None = _state.get("redis")
-    checks = {"status": "ok"}
+    checks = {"status": "ok", "version": VERSION}
     if rdb is not None:
         try:
             checks["redis"] = "ok" if rdb.ping() else "down"
@@ -126,6 +128,7 @@ def metrics():
     processed = int(stats.get("processed", 0))
     empty = int(stats.get("empty", 0))
     return {
+        "version": VERSION,
         "workerId": settings.worker_id,
         "uptimeS": int(time.time() - _state.get("started_at", time.time())),
         "asr": settings.asr_provider,

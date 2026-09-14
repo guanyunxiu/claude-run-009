@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
-import { buildViewerLink, saveTokens, saveViewToken } from "../lib/tokens";
+import { buildViewerLink, saveTokens, saveViewToken, viewerPath } from "../lib/tokens";
 
 const LANGUAGES: Record<string, string> = {
   zh: "中文",
@@ -226,7 +226,10 @@ export default function HomePage() {
           {sessions.length === 0 && (
             <p className="text-sm text-slate-600">暂无本机会话记录。</p>
           )}
-          {sessions.map((session) => (
+          {sessions.map((session) => {
+            // 观众席链接必须带令牌：本机存有 view/host 令牌才渲染，避免裸链接 401。
+            const watchTo = viewerPath(session.id);
+            return (
             <div
               key={session.id}
               className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3"
@@ -246,15 +249,25 @@ export default function HomePage() {
                     主播台
                   </Link>
                 )}
-                <Link
-                  className="rounded bg-slate-800 px-2.5 py-1 text-slate-300 hover:bg-slate-700"
-                  to={`/watch/${session.id}`}
-                >
-                  观众席
-                </Link>
+                {watchTo ? (
+                  <Link
+                    className="rounded bg-slate-800 px-2.5 py-1 text-slate-300 hover:bg-slate-700"
+                    to={watchTo}
+                  >
+                    观众席
+                  </Link>
+                ) : (
+                  <span
+                    title="本机没有该会话的观众令牌，请使用主播分享的邀请链接"
+                    className="cursor-not-allowed rounded bg-slate-800/50 px-2.5 py-1 text-slate-600"
+                  >
+                    观众席
+                  </span>
+                )}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       </section>
     </div>

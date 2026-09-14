@@ -72,3 +72,14 @@ export function buildViewerLink(sessionId: string, viewToken: string): string {
   url.searchParams.set("token", viewToken);
   return url.toString();
 }
+
+/**
+ * 构造站内 <Link to=…> 用的观众路径，确保总是带 token。
+ * 优先用显式传入的令牌，否则回退到本机已保存的 viewToken/hostToken；
+ * 都没有时返回 null（调用方应隐藏入口，而不是渲染一个必然 401 的裸链接）。
+ */
+export function viewerPath(sessionId: string, explicitToken?: string): string | null {
+  const token = explicitToken || getViewToken(sessionId) || getHostToken(sessionId);
+  if (!token) return null;
+  return `/watch/${sessionId}?token=${encodeURIComponent(token)}`;
+}

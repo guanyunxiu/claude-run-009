@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { AudioRecorder, type PcmChunk } from "../lib/recorder";
 import type { SessionInfo } from "../lib/types";
-import { resolveToken, getViewToken } from "../lib/tokens";
+import { resolveToken, getViewToken, viewerPath } from "../lib/tokens";
 import { useSubtitles } from "../lib/useSubtitles";
 import { usePipelineStatus } from "../lib/usePipelineStatus";
 import { ConnectionBadge } from "../components/ConnectionBadge";
@@ -223,12 +223,21 @@ export default function BroadcastPage() {
         >
           结束直播
         </button>
-        <Link
-          to={`/watch/${id}`}
-          className="rounded-lg border border-slate-700 px-5 py-2.5 text-sm text-slate-300 hover:border-slate-500"
-        >
-          打开观众视角 ↗
-        </Link>
+        {viewToken ? (
+          <Link
+            to={viewerPath(id, viewToken)!}
+            className="rounded-lg border border-slate-700 px-5 py-2.5 text-sm text-slate-300 hover:border-slate-500"
+          >
+            打开观众视角 ↗
+          </Link>
+        ) : (
+          <span
+            title="正在读取观众令牌…"
+            className="cursor-not-allowed rounded-lg border border-slate-800 px-5 py-2.5 text-sm text-slate-600"
+          >
+            打开观众视角 ↗
+          </span>
+        )}
         <div className="ml-auto">
           <LatencyMeter latency={subtitles.lastLatency} />
         </div>

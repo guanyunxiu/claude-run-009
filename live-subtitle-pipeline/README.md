@@ -164,6 +164,15 @@ live-subtitle-pipeline/
 
 **切片在涨但没字幕**
 
+0. **先确认 worker 进程加载的是新代码**。本机裸跑的 uvicorn 不会自动加载磁盘改动，
+   必须重启；用版本字段核对（旧进程没有 `version`，旧 VAD 仍会把轻声判空）：
+   ```bash
+   curl -s localhost:8000/health          # 新进程含 "version":"2026.09.14-vad"
+   curl -s localhost:8000/metrics         # 含 emptyRatio
+   # 本机裸跑：重启进程
+   #   在 worker/ 目录重新执行 uvicorn app.main:app --host 0.0.0.0 --port 8000
+   # Docker：docker compose restart asr-worker   （或下方强制重建）
+   ```
 1. 确认容器里跑的是新网关包（旧包没有探针路由）：
    ```bash
    curl -s localhost:8080/api/v1/health            # 新包返回含 "version"
@@ -173,7 +182,7 @@ live-subtitle-pipeline/
 2. 看 worker 空转写率（轻声/降噪被误判为空时该值接近 1）：
    ```bash
    curl -s localhost:8000/metrics      # stats.processed / stats.empty / emptyRatio
-   docker compose logs asr-worker | grep -E "processed|empty final|failed"
+   docker compose logs asr-worker | grep -E "booting version|processed|empty final|failed"
    ```
    VAD 已改为自适应语音活动检测（帧能量 + 低频周期性 + 峰均比），低至 -54dBFS 峰值的轻声也会出字幕；真正的数字静音/稳态噪声才判空。
 3. 前端主播台在“有分片但 ~12s 无字幕”时会直接显示 stalled 告警与队列积压。
@@ -183,6 +192,8 @@ live-subtitle-pipeline/
 docker compose build --no-cache gateway asr-worker frontend
 docker compose up -d --force-recreate gateway asr-worker frontend
 ```
-网关多阶段构建从源码编译；仓库根目录 `bin/gateway-linux`（amd64）仅为离线预编译产物，不进入 Docker 构建上下文，也不参与镜像内容。
+网关多阶段构建从源码编译；worker 镜像在最后一步 `COPY app` 带入最新代码且设
+`PYTHONDONTWRITEBYTECODE=1`（不产生可能陈旧的 .pyc）。仓库根目录
+`bin/gateway-linux`（amd64）仅为离线预编译产物，不进入 Docker 构建上下文。
 
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/API.md](docs/API.md)。
