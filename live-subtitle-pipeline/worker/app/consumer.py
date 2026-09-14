@@ -243,6 +243,13 @@ class Consumer:
             emittedMs=emitted,
         )
 
-        # 先持久化再广播：REST/重连回放与实时推送看到的状态一致。
-        self.database.upsert_subtitle(payload)
+        # 实时性优先：先广播让在线观众立即看到字幕，再持久化。
+        # 持久化失败只记录、不阻断实时推送（否则会出现“切片在涨却永远等不到字幕”）；
+        # 消息仍会 ACK，PG 短暂故障期间该条不进历史，但在线字幕与后续直播不受影响。
         self.bus.publish_subtitle(payload)
+        try:
+            self.database.upsert_subtitle(payload)
+        except Exception:
+            self.stats["persist_failed"] = self.stats.get("persist_failed", 0) + 1
+            logger.exception("persist subtitle failed (realtime pushed) session=%s seq=%d",
+                             task.session_id, task.seq)

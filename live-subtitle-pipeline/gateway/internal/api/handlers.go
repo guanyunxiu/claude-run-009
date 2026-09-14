@@ -107,6 +107,8 @@ func (s *Server) buildRoutes() {
 		{
 			sess.GET("", s.handleGetSession)
 			sess.GET("/subtitles", s.handleListSubtitles)
+			// 流水线探针：最近分片/字幕时间与队列积压，供前端在“无字幕”时提示原因。
+			sess.GET("/pipeline-status", s.handlePipelineStatus)
 			// WebSocket：浏览器无法设置请求头，允许 query token（仅读）。
 			// Origin 在 Hub.HandleWS 内做白名单/同源校验。
 			sess.GET("/subtitles/ws", func(c *gin.Context) {
@@ -499,6 +501,44 @@ func (s *Server) handleUploadChunk(ctx *gin.Context) {
 		"bytes":     len(body),
 		"streamId":  messageID,
 		"status":    "queued",
+	})
+}
+
+// handlePipelineStatus 返回会话流水线探针：
+// 最近上传分片时间、最近落库字幕时间、任务队列积压，用于区分
+// “WS 没连上”与“worker 没在出结果”。
+func (s *Server) handlePipelineStatus(ctx *gin.Context) {
+	sessionID := ctx.Param("id")
+
+	var chunkCount int64
+	if err := s.db.QueryRowContext(ctx.Request.Context(),
+		`SELECT count(*) FROM audio_chunks WHERE session_id=$1`, sessionID).Scan(&chunkCount); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var lastChunkAt, lastSubAt sql.NullTime
+	_ = s.db.QueryRowContext(ctx.Request.Context(),
+		`SELECT max(created_at) FROM audio_chunks WHERE session_id=$1`, sessionID).Scan(&lastChunkAt)
+	_ = s.db.QueryRowContext(ctx.Request.Context(),
+		`SELECT max(created_at) FROM subtitles WHERE session_id=$1`, sessionID).Scan(&lastSubAt)
+
+	// 队列积压（Stream 长度，近似）。
+	streamLen, _ := s.rdb.XLen(ctx.Request.Context(), s.cfg.StreamName).Result()
+
+	millis := func(t sql.NullTime) int64 {
+		if !t.Valid {
+			return 0
+		}
+		return t.Time.UnixMilli()
+	}
+	ctx.JSON(http.StatusOK, gin.H{
+		"sessionId":      sessionID,
+		"chunks":         chunkCount,
+		"lastChunkMs":    millis(lastChunkAt),
+		"lastSubtitleMs": millis(lastSubAt),
+		"streamBacklog":  streamLen,
+		"serverMs":       time.Now().UnixMilli(),
 	})
 }
 

@@ -3,9 +3,11 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { AudioRecorder, type PcmChunk } from "../lib/recorder";
 import type { SessionInfo } from "../lib/types";
-import { resolveToken } from "../lib/tokens";
+import { resolveToken, getViewToken } from "../lib/tokens";
 import { useSubtitles } from "../lib/useSubtitles";
+import { usePipelineStatus } from "../lib/usePipelineStatus";
 import { ConnectionBadge } from "../components/ConnectionBadge";
+import { InviteLink } from "../components/InviteLink";
 import { LatencyMeter } from "../components/LatencyMeter";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 
@@ -35,6 +37,11 @@ export default function BroadcastPage() {
     () => resolveToken(id, "host", new URLSearchParams(window.location.search).get("token")),
     [id],
   );
+  // 邀请链接用 viewToken（创建会话时已存入 localStorage）。
+  const [viewToken, setViewToken] = useState("");
+  useEffect(() => {
+    setViewToken(getViewToken(id));
+  }, [id]);
 
   const recorderRef = useRef<AudioRecorder | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -44,6 +51,13 @@ export default function BroadcastPage() {
 
   const subtitles = useSubtitles(session?.id, { token });
   const lastFinal = subtitles.finals[subtitles.finals.length - 1] ?? null;
+  const hasSubtitle = subtitles.finals.length > 0 || subtitles.currentPartial !== null;
+  const { warning: pipelineWarning } = usePipelineStatus(
+    session?.id,
+    token,
+    recording,
+    hasSubtitle,
+  );
 
   useEffect(() => {
     if (!token) {
@@ -220,10 +234,25 @@ export default function BroadcastPage() {
         </div>
       </div>
 
+      <div className="mb-4">
+        <InviteLink sessionId={id} viewToken={viewToken} />
+      </div>
+
       {error && <p className="mb-4 rounded-lg bg-red-900/30 px-3 py-2 text-sm text-red-300">{error}</p>}
       {subtitles.errorMessage && (
         <p className="mb-4 rounded-lg bg-red-900/30 px-3 py-2 text-sm text-red-300">
           {subtitles.errorMessage}
+        </p>
+      )}
+      {pipelineWarning.level !== "ok" && recording && (
+        <p
+          className={`mb-4 rounded-lg px-3 py-2 text-sm ${
+            pipelineWarning.level === "stalled"
+              ? "bg-amber-900/30 text-amber-300"
+              : "bg-slate-800/60 text-slate-300"
+          }`}
+        >
+          {pipelineWarning.message}
         </p>
       )}
 

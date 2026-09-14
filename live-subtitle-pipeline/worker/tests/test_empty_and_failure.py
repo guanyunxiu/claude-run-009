@@ -69,3 +69,34 @@ def test_final_exception_propagates_not_swallowed():
 
     with pytest.raises(RuntimeError, match="decode failed"):
         consumer.process(_task())
+
+
+class _FixedASR:
+    """final 固定产出非空文本。"""
+    name = "fixed"
+
+    def transcribe(self, pcm, language, final, seq=None):
+        from app.models import Transcript
+        return Transcript(text="固定字幕" if final else "固", language=language)
+
+
+def _speech_pcm():
+    t = np.linspace(0, 3, 16000 * 3, endpoint=False)
+    return ((np.sin(2 * np.pi * 300 * t) * 0.2) * 32767).astype("<i2").tobytes()
+
+
+def test_persist_failure_still_publishes_realtime():
+    """PG 写失败不能阻断实时字幕（修复“切片在涨却等不到字幕”）。"""
+    settings = Settings(enable_partial=False)
+    store = MagicMock(); store.get.return_value = _speech_pcm()
+    db = MagicMock()
+    db.upsert_subtitle.side_effect = RuntimeError("pg unavailable")
+    bus = MagicMock()
+    consumer = Consumer(settings, MagicMock(), store, db, bus, _FixedASR(), StubTranslator())
+
+    # 不应抛出：实时推送优先，持久化失败被吞掉并计数。
+    consumer.process(_task())
+
+    published = [c.args[0] for c in bus.publish_subtitle.call_args_list]
+    finals = [p for p in published if p.isFinal]
+    assert len(finals) == 1 and finals[0].text == "固定字幕"

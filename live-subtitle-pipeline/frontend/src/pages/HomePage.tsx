@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
-import { buildViewerLink, saveTokens } from "../lib/tokens";
+import { buildViewerLink, saveTokens, saveViewToken } from "../lib/tokens";
 
 const LANGUAGES: Record<string, string> = {
   zh: "中文",
@@ -40,6 +40,29 @@ function pushRecent(session: RecentSession) {
   }
 }
 
+/**
+ * 解析观众粘贴的邀请链接或令牌。
+ * 支持：
+ *   https://host/watch/<id>?token=<viewToken>
+ *   /watch/<id>?token=<viewToken>
+ *   直接粘贴 viewToken（需另填会话号，这里要求链接形式）
+ */
+function parseInvite(input: string): { id: string; token: string } | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed, window.location.origin);
+    const match = url.pathname.match(/\/watch\/([^/]+)\/?$/);
+    const token = url.searchParams.get("token") ?? "";
+    if (match && token) {
+      return { id: match[1], token };
+    }
+  } catch {
+    /* 非合法 URL，继续尝试纯 token 情况 */
+  }
+  return null;
+}
+
 export default function HomePage() {
   const navigate = useNavigate();
   const [sourceLanguage, setSourceLanguage] = useState("zh");
@@ -48,6 +71,8 @@ export default function HomePage() {
   const [sessions, setSessions] = useState<RecentSession[]>([]);
   const [error, setError] = useState("");
   const [viewerLink, setViewerLink] = useState("");
+  const [inviteInput, setInviteInput] = useState("");
+  const [joinError, setJoinError] = useState("");
 
   useEffect(() => {
     setSessions(loadRecent());
@@ -59,7 +84,8 @@ export default function HomePage() {
     );
   }
 
-  async function createSession(role: "broadcaster" | "viewer") {
+  // 仅主播入口会创建会话；观众通过邀请链接“加入”已有直播，不再新建空会话。
+  async function createBroadcasterSession() {
     setError("");
     setCreating(true);
     try {
@@ -84,18 +110,29 @@ export default function HomePage() {
         createdAt: session.createdAt,
         hasHostToken: true,
       });
-      setViewerLink(
-        buildViewerLink(session.id, session.viewToken),
-      );
-      navigate(
-        role === "broadcaster"
-          ? `/broadcast/${session.id}`
-          : `/watch/${session.id}?token=${encodeURIComponent(session.viewToken)}`,
-      );
+      setViewerLink(buildViewerLink(session.id, session.viewToken));
+      navigate(`/broadcast/${session.id}`);
     } catch (exc) {
       setError((exc as Error).message);
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function joinByInvite() {
+    setJoinError("");
+    const parsed = parseInvite(inviteInput);
+    if (!parsed) {
+      setJoinError("邀请链接格式不正确，应为主播提供的 /watch/<会话号>?token=… 链接。");
+      return;
+    }
+    try {
+      // 用邀请令牌校验会话确实存在/可访问，再保存令牌并跳转。
+      const info = await api.getSession(parsed.id, { token: parsed.token });
+      saveViewToken(info.id, parsed.token);
+      navigate(`/watch/${info.id}?token=${encodeURIComponent(parsed.token)}`);
+    } catch (exc) {
+      setJoinError("无法加入：" + (exc as Error).message);
     }
   }
 
@@ -109,7 +146,7 @@ export default function HomePage() {
       </header>
 
       <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
-        <h2 className="mb-4 text-lg font-semibold text-white">新建直播会话</h2>
+        <h2 className="mb-4 text-lg font-semibold text-white">我是主播 · 新建直播</h2>
 
         <label className="mb-2 block text-sm text-slate-400">源语言（ASR 单语言转写）</label>
         <select
@@ -146,27 +183,39 @@ export default function HomePage() {
 
         {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
 
-        <div className="flex gap-3">
+        <button
+          disabled={creating}
+          onClick={createBroadcasterSession}
+          className="w-full rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-500 disabled:opacity-50"
+        >
+          🎙 创建直播并进入主播台（开始采集）
+        </button>
+        {viewerLink && (
+          <p className="mt-3 break-all text-xs text-slate-500">本场邀请链接：{viewerLink}</p>
+        )}
+      </section>
+
+      <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
+        <h2 className="mb-2 text-lg font-semibold text-white">我是观众 · 加入已有直播</h2>
+        <p className="mb-3 text-xs text-slate-500">
+          观众不会新建直播。请粘贴主播分享的邀请链接（形如 …/watch/会话号?token=…）。
+        </p>
+        <div className="flex gap-2">
+          <input
+            value={inviteInput}
+            onChange={(e) => setInviteInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && joinByInvite()}
+            placeholder="https://…/watch/xxxxxxxx?token=…"
+            className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white placeholder:text-slate-600"
+          />
           <button
-            disabled={creating}
-            onClick={() => createSession("broadcaster")}
-            className="flex-1 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-500 disabled:opacity-50"
+            onClick={joinByInvite}
+            className="shrink-0 rounded-lg border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-slate-400"
           >
-            🎙 我是主播（开始采集）
-          </button>
-          <button
-            disabled={creating}
-            onClick={() => createSession("viewer")}
-            className="flex-1 rounded-lg border border-slate-600 px-4 py-2.5 text-sm font-semibold text-slate-200 hover:border-slate-400 disabled:opacity-50"
-          >
-            👀 以观众身份进入
+            加入直播
           </button>
         </div>
-        {viewerLink && (
-          <p className="mt-3 break-all text-xs text-slate-500">
-            观众邀请链接：{viewerLink}
-          </p>
-        )}
+        {joinError && <p className="mt-2 text-sm text-red-400">{joinError}</p>}
       </section>
 
       <section className="mt-8">
@@ -189,12 +238,14 @@ export default function HomePage() {
                 </span>
               </div>
               <div className="flex gap-2 text-xs">
-                <Link
-                  className="rounded bg-slate-800 px-2.5 py-1 text-slate-300 hover:bg-slate-700"
-                  to={`/broadcast/${session.id}`}
-                >
-                  主播台
-                </Link>
+                {session.hasHostToken && (
+                  <Link
+                    className="rounded bg-slate-800 px-2.5 py-1 text-slate-300 hover:bg-slate-700"
+                    to={`/broadcast/${session.id}`}
+                  >
+                    主播台
+                  </Link>
+                )}
                 <Link
                   className="rounded bg-slate-800 px-2.5 py-1 text-slate-300 hover:bg-slate-700"
                   to={`/watch/${session.id}`}

@@ -155,6 +155,7 @@ func TestViewTokenPassesRealReadRoutes(t *testing.T) {
 	paths := []string{
 		"/api/v1/sessions/x",
 		"/api/v1/sessions/x/subtitles",
+		"/api/v1/sessions/x/pipeline-status",
 	}
 	for _, path := range paths {
 		w := httptest.NewRecorder()

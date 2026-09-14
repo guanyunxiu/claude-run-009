@@ -1,5 +1,6 @@
 import type {
   CreateSessionRequest,
+  PipelineStatus,
   ServerTime,
   SessionInfo,
   Subtitle,
@@ -75,6 +76,13 @@ export const api = {
   listSubtitles: (id: string, limit = 100, opts?: CallOptions) =>
     request<{ sessionId: string; subtitles: Subtitle[] }>(
       `/api/v1/sessions/${id}/subtitles?limit=${limit}`,
+      undefined,
+      opts,
+    ),
+
+  pipelineStatus: (id: string, opts?: CallOptions) =>
+    request<PipelineStatus>(
+      `/api/v1/sessions/${id}/pipeline-status`,
       undefined,
       opts,
     ),

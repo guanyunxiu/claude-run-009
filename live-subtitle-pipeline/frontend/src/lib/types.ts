@@ -58,3 +58,12 @@ export interface ServerTime {
   serverMs: number;
   iso: string;
 }
+
+export interface PipelineStatus {
+  sessionId: string;
+  chunks: number;
+  lastChunkMs: number;
+  lastSubtitleMs: number;
+  streamBacklog: number;
+  serverMs: number;
+}
