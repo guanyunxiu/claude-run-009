@@ -61,20 +61,24 @@ class WhisperASR:
         lang = language or self.default_language
         beam = self.beam_size if final else self.partial_beam_size
 
-        text, info = self._transcribe_once(pcm, lang, beam, vad=False)
+        # 默认关 VAD：2-4 秒短切片整片解码，Silero VAD 反而容易把轻声整段丢掉。
+        text, info = self._transcribe_once(pcm, lang, beam, no_speech_thresh=0.6)
 
-        # 空结果回退链：先贪心解码，再开 VAD（部分切片能量分布导致整段被判静音）。
+        # 空结果回退链（均保持 VAD 关闭，避免吞掉轻声）：
+        # 1) 贪心解码 + 降低无语音阈值；2) 不指定语言重试；3) compute_type=default。
         if not text:
-            logger.info("whisper empty result seq=%s final=%s beam=%d, retry greedy+vad",
-                        seq, final, beam)
-            text, info = self._transcribe_once(pcm, lang, 1, vad=True)
+            logger.info("whisper empty seq=%s final=%s, retry greedy low-threshold", seq, final)
+            text, info = self._transcribe_once(pcm, lang, 1, no_speech_thresh=0.9)
+        if not text and lang:
+            logger.info("whisper still empty seq=%s, retry with auto language", seq)
+            text, info = self._transcribe_once(pcm, None, 1, no_speech_thresh=0.9)
         if not text and self.compute_type not in ("default", "auto"):
-            logger.warning("whisper still empty seq=%s, retrying with compute_type=default", seq)
+            logger.warning("whisper empty seq=%s, retry compute_type=default", seq)
             try:
                 fallback_model = self._load_model("default")
                 segments, info = fallback_model.transcribe(
                     pcm, language=lang, beam_size=1,
-                    vad_filter=True, condition_on_previous_text=False,
+                    vad_filter=False, condition_on_previous_text=False,
                 )
                 text = "".join(s.text for s in segments).strip()
             except Exception:
@@ -84,17 +88,19 @@ class WhisperASR:
         confidence = float(getattr(info, "avg_logprob", 0.0) or 0.0)
         return Transcript(text=text, language=detected, confidence=confidence)
 
-    def _transcribe_once(self, pcm: np.ndarray, lang, beam: int, vad: bool):
+    def _transcribe_once(self, pcm: np.ndarray, lang, beam: int, no_speech_thresh: float):
         # 立即物化生成器：faster-whisper 的真正解码发生在迭代时，
         # 不在这里消费就无法捕获解码异常（会被误当成“空字幕”）。
-        segments, info = self.model.transcribe(
-            pcm,
-            language=lang,
+        kwargs = dict(
             beam_size=beam,
-            # 2-4 秒短切片默认关 VAD 整片出结果；回退时开 VAD 再试。
-            vad_filter=vad,
+            vad_filter=False,
             condition_on_previous_text=False,
             without_timestamps=True,
+            no_speech_threshold=no_speech_thresh,
+            compression_ratio_threshold=2.4,
         )
+        if lang:
+            kwargs["language"] = lang
+        segments, info = self.model.transcribe(pcm, **kwargs)
         text = "".join(segment.text for segment in segments).strip()
         return text, info

@@ -13,12 +13,14 @@ import logging
 import time
 from typing import Any
 
+import numpy as np
 import redis
 
-from .audio import decode_audio, is_silence
+from .audio import decode_audio, has_speech
 from .config import Settings
 from .models import ChunkTask, SubtitlePayload
 from .services import Database, EventBus, ObjectStorage
+
 logger = logging.getLogger(__name__)
 
 MIN_IDLE_MS = 30_000
@@ -180,7 +182,8 @@ class Consumer:
         )
 
         # --- partial 通道：低算力转写，尽快上屏（不翻译、不落库）---
-        if self.settings.enable_partial and not is_silence(pcm):
+        voiced = has_speech(pcm, sample_rate=task.sample_rate or 16000)
+        if self.settings.enable_partial and voiced:
             partial_started = time.time()
             # partial 容错：失败不影响 final 权威结果。
             try:
@@ -217,8 +220,12 @@ class Consumer:
         text = final.text.strip()
         if not text:
             # 空 final（静音切片）不落库、不推送，避免空字幕覆盖时间轴。
-            logger.info("empty final transcript skipped session=%s seq=%d asrMs=%d",
-                        task.session_id, task.seq, asr_ms)
+            rms = float(np.sqrt(np.mean(np.square(pcm)))) if pcm.size else 0.0
+            peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
+            logger.info(
+                "empty final skipped session=%s seq=%d asrMs=%d voiced=%s rms=%.5f peak=%.4f",
+                task.session_id, task.seq, asr_ms, voiced, rms, peak,
+            )
             self.stats["empty"] = self.stats.get("empty", 0) + 1
             return
 

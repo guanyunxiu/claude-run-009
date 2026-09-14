@@ -22,3 +22,7 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+# rebuilt gateway binaries (host git add gets SIGKILL on these)
+bin/gateway
+bin/gateway-linux

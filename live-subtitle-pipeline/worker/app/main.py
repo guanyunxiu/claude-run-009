@@ -122,10 +122,15 @@ def health():
 @app.get("/metrics")
 def metrics():
     consumer = _state.get("consumer")
+    stats = consumer.stats if consumer else {}
+    processed = int(stats.get("processed", 0))
+    empty = int(stats.get("empty", 0))
     return {
         "workerId": settings.worker_id,
         "uptimeS": int(time.time() - _state.get("started_at", time.time())),
         "asr": settings.asr_provider,
         "translator": settings.translate_provider,
-        "stats": consumer.stats if consumer else {},
+        "stats": stats,
+        # 空 final 占比：接近 1 说明大量切片被判无语音（麦克风/降噪/VAD 问题）。
+        "emptyRatio": round(empty / processed, 3) if processed else 0.0,
     }

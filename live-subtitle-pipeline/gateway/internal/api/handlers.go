@@ -22,6 +22,7 @@ import (
 	"github.com/livesub/gateway/internal/model"
 	"github.com/livesub/gateway/internal/queue"
 	"github.com/livesub/gateway/internal/storage"
+	"github.com/livesub/gateway/internal/version"
 	"github.com/livesub/gateway/internal/ws"
 )
 
@@ -132,17 +133,24 @@ func (s *Server) buildRoutes() {
 func (s *Server) Router() *gin.Engine { return s.router }
 
 func (s *Server) handleHealth(ctx *gin.Context) {
-	resp := map[string]string{"status": "ok"}
-
-	if err := s.db.PingContext(ctx.Request.Context()); err != nil {
-		resp["postgres"] = "down"
-	} else {
-		resp["postgres"] = "ok"
+	resp := map[string]string{
+		"status":  "ok",
+		"version": version.String(),
 	}
-	if err := s.rdb.Ping(ctx.Request.Context()).Err(); err != nil {
-		resp["redis"] = "down"
-	} else {
-		resp["redis"] = "ok"
+
+	if s.db != nil {
+		if err := s.db.PingContext(ctx.Request.Context()); err != nil {
+			resp["postgres"] = "down"
+		} else {
+			resp["postgres"] = "ok"
+		}
+	}
+	if s.rdb != nil {
+		if err := s.rdb.Ping(ctx.Request.Context()).Err(); err != nil {
+			resp["redis"] = "down"
+		} else {
+			resp["redis"] = "ok"
+		}
 	}
 
 	status := http.StatusOK

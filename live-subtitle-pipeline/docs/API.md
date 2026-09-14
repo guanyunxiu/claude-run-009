@@ -31,8 +31,9 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/health` | 网关与 Postgres/Redis 连通性 |
+| GET | `/health` | 网关与 Postgres/Redis 连通性，含 `version`（新包标识；旧包无此字段） |
 | GET | `/time` | 返回 `{serverMs, iso}`，前端用于估算时钟偏差 |
+| GET | `/sessions/:id/pipeline-status` | 流水线探针：`chunks/lastChunkMs/lastSubtitleMs/streamBacklog`，需 view+ 令牌；旧版网关无此路由（返回 404 即说明容器跑的是旧二进制） |
 
 ### 会话
 

@@ -88,7 +88,91 @@ def _decode_with_ffmpeg(data: bytes) -> tuple[np.ndarray, int]:
 
 
 def is_silence(pcm: np.ndarray, threshold: float = 0.01) -> bool:
-    """RMS 静音判断，用于跳过空分片的重计算。"""
+    """兼容旧调用名；实际语音活动判断见 has_speech。threshold 参数保留但忽略。"""
+    return not has_speech(pcm)
+
+
+def frame_rms(pcm: np.ndarray, frame_samples: int) -> np.ndarray:
+    """把一维 PCM 切成定长帧，返回每帧 RMS（无重叠）。"""
     if pcm.size == 0:
-       	return True
-    return float(np.sqrt(np.mean(np.square(pcm)))) < threshold
+        return np.empty(0, dtype=np.float32)
+    n_frames = pcm.size // frame_samples
+    if n_frames == 0:
+        return np.array([float(np.sqrt(np.mean(np.square(pcm))))], dtype=np.float32)
+    frames = pcm[: n_frames * frame_samples].reshape(n_frames, frame_samples)
+    return np.sqrt(np.mean(np.square(frames), axis=1)).astype(np.float32)
+
+
+def has_speech(
+    pcm: np.ndarray,
+    sample_rate: int = 16000,
+    frame_ms: int = 30,
+    rms_floor: float = 5.0e-4,
+    min_voiced_frames: int = 3,
+) -> bool:
+    """判断切片是否含语音活动，专门覆盖“轻声说话 / 浏览器降噪压低响度”的场景。
+
+    单一 RMS 阈值会把轻声人声误判为空，又会把稳态底噪误判为有声。这里组合：
+      1. 帧能量：高于绝对地板 rms_floor（约 -66dBFS）的帧数足够多；
+      2. 峰值：出现瞬态/持续响度（辅音、爆破）；
+      3. 帧能量起伏：语音有音节强弱，稳态底噪各帧接近；
+      4. 低频周期性：语音浊音在 70~400Hz 有显著能量，而白噪声平坦。
+    满足帧计数后，峰值/起伏/周期性任一成立即判为有语音。
+    """
+    if pcm.size == 0:
+        return False
+
+    frame_len = max(1, int(sample_rate * frame_ms / 1000))
+    energies = frame_rms(pcm, frame_len)
+    if energies.size == 0:
+        return False
+
+    n_voiced = int(np.count_nonzero(energies > rms_floor))
+    if n_voiced < min_voiced_frames:
+        return False
+
+    peak = float(np.max(np.abs(pcm)))
+    rms = float(np.sqrt(np.mean(np.square(pcm)))) if pcm.size else 0.0
+    median_e = float(np.median(energies)) + 1e-12
+    variation = float(np.max(energies)) / median_e
+    periodicity = _low_frequency_ratio(pcm, sample_rate)
+
+    # 峰均比：辅音/爆破音有高尖峰，稳态高斯噪声约 3~5。
+    crest = peak / (rms + 1e-12)
+    # 1) 浊音：人声基频带能量集中（轻声说话也成立），白噪声该比值很低。
+    voiced = periodicity >= 0.30 and peak >= 1.5e-3
+    # 2) 瞬态辅音：峰均比高且帧能量有起伏。
+    transient = crest >= 6.0 and variation >= 1.5 and peak >= 0.01
+    # 3) 很响且带语音特征（周期或瞬态），避免把稳态大噪声当语音。
+    loud = peak >= 0.03 and (periodicity >= 0.30 or crest >= 6.0)
+    return voiced or transient or loud
+
+
+def _low_frequency_ratio(pcm: np.ndarray, sample_rate: int) -> float:
+    """估计 70~400Hz（人声基频带）能量占 70~2000Hz 能量的比例。
+
+    浊音该比值明显偏高，白噪声能量平坦、比值低。为覆盖“切片前半静音、
+    后半才说话”的情况，取整段中能量最高的 1 秒窗口做 FFT，而不是固定开头。
+    """
+    win_len = min(pcm.size, sample_rate)
+    if win_len < 256:
+        return 0.0
+
+    if pcm.size > win_len:
+        energies = frame_rms(pcm, win_len)
+        # 取最响的整秒窗口；不足整秒的尾部不参与（避免静音尾部稀释）。
+        start = int(np.argmax(energies)) * win_len
+        win = pcm[start:start + win_len].astype(np.float32)
+        if win.size < 256:
+            win = pcm[:win_len].astype(np.float32)
+    else:
+        win = pcm.astype(np.float32)
+
+    win = win - float(np.mean(win))
+    spectrum = np.abs(np.fft.rfft(win * np.hanning(win.size)))
+    freqs = np.fft.rfftfreq(win.size, d=1.0 / sample_rate)
+    band_voice = (freqs >= 70) & (freqs <= 400)
+    band_ref = (freqs >= 70) & (freqs <= 2000)
+    e_voice = float(np.sum(spectrum[band_voice] ** 2))
+    e_ref = float(np.sum(spectrum[band_ref] ** 2)) + 1e-12
+    return e_voice / e_ref

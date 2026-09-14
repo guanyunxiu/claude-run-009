@@ -160,4 +160,29 @@ live-subtitle-pipeline/
 - **断线重连**：前端 1→2→4…15s 退避重连，`replay` 参数由网关回放最近 final；REST 支持 `beforeSeq` 翻历史。
 - **延迟可观测**：每条字幕带 `queueMs / asrMs / e2eMs`，前端分段着色展示。
 
+## 排障
+
+**切片在涨但没字幕**
+
+1. 确认容器里跑的是新网关包（旧包没有探针路由）：
+   ```bash
+   curl -s localhost:8080/api/v1/health            # 新包返回含 "version"
+   curl -s "localhost:8080/api/v1/sessions/<id>/pipeline-status?token=<viewToken>"
+   # 404 = 容器是旧二进制，需要强制重建（见下）
+   ```
+2. 看 worker 空转写率（轻声/降噪被误判为空时该值接近 1）：
+   ```bash
+   curl -s localhost:8000/metrics      # stats.processed / stats.empty / emptyRatio
+   docker compose logs asr-worker | grep -E "processed|empty final|failed"
+   ```
+   VAD 已改为自适应语音活动检测（帧能量 + 低频周期性 + 峰均比），低至 -54dBFS 峰值的轻声也会出字幕；真正的数字静音/稳态噪声才判空。
+3. 前端主播台在“有分片但 ~12s 无字幕”时会直接显示 stalled 告警与队列积压。
+
+**强制重建，避免容器跑旧包**（Docker 构建缓存或复用了旧镜像时）：
+```bash
+docker compose build --no-cache gateway asr-worker frontend
+docker compose up -d --force-recreate gateway asr-worker frontend
+```
+网关多阶段构建从源码编译；仓库根目录 `bin/gateway-linux`（amd64）仅为离线预编译产物，不进入 Docker 构建上下文，也不参与镜像内容。
+
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/API.md](docs/API.md)。
